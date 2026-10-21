@@ -179,9 +179,23 @@ def notifications_restore(previous: dict) -> None:
             pass
 
 
+DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}$")
+APP_RE = re.compile(r'^[^\\/:*?"<>|\x00-\x1f]{1,80}\.exe$')
+ICON_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+MAX_BODY = 256 * 1024
+
+
 def clean_domain(site: str) -> str:
-    site = site.strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
-    return site.removeprefix("www.")
+    """Domaine normalisé, ou "" s'il est invalide (protège le fichier hosts contre l'injection de lignes)."""
+    site = site.strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0].split(":")[0]
+    site = site.removeprefix("www.")
+    return site if DOMAIN_RE.match(site) else ""
+
+
+def clean_app(name: str) -> str:
+    name = name.strip().lower()
+    name = name if name.endswith(".exe") else name + ".exe"
+    return name if APP_RE.match(name) and name not in PROTECTED else ""
 
 
 def strip_hosts_block(content: str) -> str:
@@ -336,6 +350,8 @@ def scan_installed_apps(refresh: bool = False) -> list[dict]:
         if current is None or len(name) < len(current["name"]):
             by_exe[exe] = {"name": name, "exe": exe, "icon": item.get("icon") or (current or {}).get("icon", ""),
                            "category": categorize(name, exe)}
+            if not ICON_RE.match(by_exe[exe]["icon"] or "="):
+                by_exe[exe]["icon"] = ""
     apps = sorted(by_exe.values(), key=lambda a: a["name"].casefold())
     if apps:
         save_json(APPS_CACHE, apps)
@@ -377,6 +393,22 @@ def open_window(url: str) -> None:
 # --- Moteur --------------------------------------------------------------------
 class ApiError(Exception):
     pass
+
+
+def _list_of_str(data: dict, key: str) -> list[str]:
+    value = data[key]
+    if not isinstance(value, list):
+        raise ApiError("Liste attendue.")
+    return [str(x) for x in value]
+
+
+def _int(value, message: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ApiError(message)
+    try:
+        return int(value)
+    except ValueError:
+        raise ApiError(message) from None
 
 
 class Engine:
@@ -509,8 +541,9 @@ class Engine:
         with self.lock:
             if self.session:
                 raise ApiError("Une session est déjà en cours.")
-            intention = str(data.get("intention", "")).strip()
-            minutes = int(data.get("minutes", 0))
+            intention = data.get("intention", "")
+            intention = intention.strip() if isinstance(intention, str) else ""
+            minutes = _int(data.get("minutes"), "Choisis une durée entre 5 et 480 minutes.")
             if not intention:
                 raise ApiError("Écris ton intention avant de commencer.")
             if not 5 <= minutes <= 480:
@@ -545,7 +578,8 @@ class Engine:
             for s in self.sessions:
                 if s["id"] == data.get("id"):
                     depth = data.get("depth")
-                    s["depth"] = int(depth) if depth in (1, 2, 3, 4, 5) else None
+                    ok = isinstance(depth, int) and not isinstance(depth, bool) and 1 <= depth <= 5
+                    s["depth"] = depth if ok else None
                     s["note"] = str(data.get("note", "")).strip()[:500]
             save_json(SESSIONS_FILE, self.sessions)
             self.review_id = None
@@ -556,22 +590,22 @@ class Engine:
             cfg = self.config
             st = self.session
             if "apps" in data:
-                apps = sorted({(a if a.endswith(".exe") else a + ".exe") for a in
-                               (str(x).strip().lower() for x in data["apps"]) if a} - PROTECTED)
+                apps = sorted({a for a in map(clean_app, _list_of_str(data, "apps")) if a})
                 if st and st["lock"] and not set(cfg["apps"]) <= set(apps):
                     raise ApiError("Mode engagement : tu peux ajouter des blocages, pas en retirer.")
                 cfg["apps"] = apps
             if "sites" in data:
-                sites = sorted({d for d in (clean_domain(str(x)) for x in data["sites"]) if "." in d})
+                sites = sorted({d for d in map(clean_domain, _list_of_str(data, "sites")) if d})
                 if st and st["lock"] and not set(cfg["sites"]) <= set(sites):
                     raise ApiError("Mode engagement : tu peux ajouter des blocages, pas en retirer.")
                 cfg["sites"] = sites
                 if st and st["sites"]:
                     block_sites(sites)
             if "weekly_goal_hours" in data:
-                cfg["weekly_goal_hours"] = max(1, min(80, int(data["weekly_goal_hours"])))
+                cfg["weekly_goal_hours"] = max(1, min(80, _int(data["weekly_goal_hours"], "Objectif invalide.")))
             if "shutdown_checklist" in data:
-                cfg["shutdown_checklist"] = [str(x).strip()[:160] for x in data["shutdown_checklist"] if str(x).strip()]
+                cfg["shutdown_checklist"] = [x.strip()[:160] for x in _list_of_str(data, "shutdown_checklist")
+                                             if x.strip()]
             if data.get("shutdown_done"):
                 cfg["last_shutdown"] = dt.date.today().isoformat()
             save_json(CONFIG_FILE, cfg)
@@ -592,6 +626,11 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/app.js": ("app.js", "text/javascript; charset=utf-8")}
 
 
+# La page n'exécute que ses propres scripts et ne peut pas être intégrée dans une iframe (clickjacking).
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+
+
 def make_handler(engine: Engine, token: str, port_ref: list):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -601,6 +640,9 @@ def make_handler(engine: Engine, token: str, port_ref: list):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy", CSP)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -634,13 +676,22 @@ def make_handler(engine: Engine, token: str, port_ref: list):
             self._json(404, {"error": "Introuvable."})
 
         def do_POST(self):
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = -1
+            if not 0 <= length <= MAX_BODY:
+                self.close_connection = True
+                return self._json(413 if length > MAX_BODY else 400, {"error": "Requête invalide."})
+            raw = self.rfile.read(length)
             if not self._api_ok():
                 return self._json(403, {"error": "Accès refusé."})
-            length = int(self.headers.get("Content-Length") or 0)
             try:
-                data = json.loads(self.rfile.read(length) or b"{}")
+                data = json.loads(raw or b"{}")
             except ValueError:
-                data = {}
+                data = None
+            if not isinstance(data, dict):
+                return self._json(400, {"error": "Requête invalide."})
             actions = {"/api/start": engine.start, "/api/stop": engine.stop, "/api/review": engine.review,
                        "/api/config": engine.update_config}
             try:

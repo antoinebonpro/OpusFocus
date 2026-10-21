@@ -32,6 +32,17 @@ Si l'application plante, la session reprend au prochain lancement ; si elle est 
 ## Données
 Elles sont stockées dans `%APPDATA%\DeepWorkFocus\` : `config.json` (listes et réglages), `sessions.json` (historique), `apps.json` (cache des applications) et `state.json` (session en cours).
 
+## Sécurité
+- L'interface n'écoute que sur `127.0.0.1`. Chaque appel à l'API exige un jeton aléatoire, et l'en-tête `Host` est vérifié contre le DNS rebinding.
+- Une politique CSP stricte n'autorise que les scripts de l'application et interdit l'affichage dans une iframe.
+- Tout ce qui est saisi est validé avant usage : domaines (aucune ligne ne peut être injectée dans le fichier `hosts`), noms d'applications, durées, notes. Les processus système ne peuvent jamais être bloqués.
+
+## Tests
+```
+python -m unittest discover -s tests -v
+```
+48 tests couvrent la logique, la sécurité de l'API (jeton, rebinding, CSP, traversée de chemin, corps malformés), le fichier `hosts`, la reprise après plantage et l'interface (échappement HTML). Ils travaillent dans un dossier temporaire et ne touchent ni tes données ni le vrai fichier `hosts`. Seuls deux tests touchent Windows, de façon contrôlée : l'un ferme un processus factice, l'autre lit la clé des notifications puis la restaure.
+
 ## Limites
 - Les applications sont fermées de force : ce qui n'y est pas enregistré est perdu.
 - Si un site reste accessible, ferme et rouvre son onglet. Si le « DNS sécurisé » est activé dans le navigateur, le blocage peut être contourné : désactive-le.

@@ -386,12 +386,13 @@ function openAbandon() {
     <p class="lead">Respire. L'envie d'arrêter fait partie de l'entraînement. Pour abandonner quand même, tape la phrase ci-dessous.</p>
     <div class="phrase" aria-hidden="true">${esc(phrase)}</div>
     <label class="sr-only" for="phrase">Phrase d'abandon : ${esc(phrase)}</label>
-    <input id="phrase" class="input" autocomplete="off" spellcheck="false" onpaste="return false">
+    <input id="phrase" class="input" autocomplete="off" spellcheck="false">
     <div class="dialog-actions">
       <button class="btn danger" data-abandon disabled>Abandonner</button>
       <button class="btn primary" data-keep>Je reprends le travail</button>
     </div>`, closeDialog);
   const input = $("#phrase", d), btn = $("[data-abandon]", d);
+  input.addEventListener("paste", (e) => e.preventDefault());
   input.addEventListener("input", () => (btn.disabled = input.value.trim().toLowerCase() !== phrase));
   $("[data-keep]", d).addEventListener("click", closeDialog);
   $("[data-keep]", d).focus();
@@ -607,7 +608,7 @@ function refreshApps() {
   const locked = lockedRemoval();
   list.innerHTML = `<div class="check-grid">${items.map((a) => checkRow({
     value: a.exe, checked: selected.has(a.exe), title: a.name, sub: a.exe,
-    media: a.icon ? `<img class="app-ico" alt="" src="data:image/png;base64,${a.icon}">` : avatar(a.name),
+    media: a.icon ? `<img class="app-ico" alt="" src="data:image/png;base64,${esc(a.icon)}">` : avatar(a.name),
     tag: a.category === "manual" ? '<span class="tag" title="Bloquée si elle est installée un jour">Non détectée</span>' : SUGGESTED.has(a.category) ? `<span class="tag suggest">${CATEGORIES[a.category].split(" ")[0]}</span>` : "",
     disabled: locked && selected.has(a.exe),
   })).join("")}</div>`;
