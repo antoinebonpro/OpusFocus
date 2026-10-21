@@ -3,31 +3,36 @@
 Bloqueur de distractions pour Windows, inspiré de *Deep Work* (Cal Newport).
 
 ## Lancer
-- **`Lancer Deep Work.bat`** : coupe les notifications et ferme les applications bloquées.
-- **`Lancer Deep Work (admin - bloque aussi les sites).bat`** : fait la même chose et bloque en plus les sites web. Windows demande une confirmation, car il faut modifier le fichier `hosts`.
+- **`Lancer Deep Work.bat`** : ouvre l'application. Elle coupe les notifications et ferme les applications cochées.
+- **`Lancer Deep Work (admin - bloque aussi les sites).bat`** : même chose, avec en plus le blocage des sites web (Windows demande une confirmation). Tu peux aussi activer ce mode plus tard, depuis l'application, avec le bouton « Activer ».
 
-Il faut seulement Python 3.10 ou plus récent. Aucune dépendance à installer.
+Il faut Python 3.10 ou plus récent, et Edge, Chrome ou Brave pour afficher la fenêtre. Aucune dépendance à installer.
 
-## Pendant une session
+## Utilisation
+1. **Session** : écris ton intention, choisis une durée, vérifie les protections, puis appuie sur *Commencer*.
+2. **Applications** : toutes les applications installées sont listées avec leur icône. Coche celles qui te distraient. Les distractions détectées (réseaux, jeux, vidéo) sont proposées en premier, et un bouton permet de toutes les cocher d'un coup.
+3. **Sites web** : coche les sites dans le catalogue ou ajoute les tiens.
+4. **Progrès** : heures par jour, objectif de la semaine, série de jours, profondeur moyenne et historique.
+5. **Fin de journée** : la checklist du rituel de fin, puis « Shutdown complete ».
+
+Les cases cochées sont enregistrées automatiquement. Tu peux fermer la fenêtre pendant une session : la protection continue, et la fenêtre se rouvre à la fin pour le bilan.
+
+## Fonctionnement
 | Protection | Comment ça marche |
 |---|---|
 | Notifications | Les toasts Windows sont coupés via le registre, puis restaurés à la fin |
-| Applications | Les processus de la liste noire sont fermés dès leur lancement (vérification toutes les 2 s) |
+| Applications | Les processus cochés sont fermés dès qu'ils apparaissent (vérification toutes les 1,5 s) |
 | Sites | Les domaines (+ `www.` et `m.`) sont redirigés vers `0.0.0.0` dans le fichier `hosts` |
-| Mode engagement | Pour arrêter avant la fin, il faut taper une phrase d'abandon |
+| Mode engagement | Pour arrêter avant la fin, il faut taper une phrase d'abandon. On peut ajouter des blocages, pas en retirer |
 
-Si l'application plante ou est fermée de force, la session reprend au prochain lancement. Si la session est déjà finie, tout est nettoyé.
+Architecture : `deepwork.py` est le moteur. Il sert l'interface (`ui/`) sur `127.0.0.1`, protégée par un jeton, et l'affiche dans une fenêtre de navigateur en mode application. `scan_apps.ps1` liste les applications du menu Démarrer et du Microsoft Store.
 
-## Les notions du livre intégrées
-- **Intention obligatoire** : on ne lance pas de session sans objectif précis.
-- **Tableau de score (4DX)** : heures de deep work par jour, objectif hebdomadaire, série de jours, profondeur notée de 1 à 5.
-- **Rituel de fin** : une checklist puis « Shutdown complete ».
-- **Les 4 règles** : un résumé du livre et des 4 philosophies (monastique, bimodale, rythmique, journalistique).
+Si l'application plante, la session reprend au prochain lancement ; si elle est déjà terminée, tout est restauré. Un navigateur peut être bloqué sans risque : les processus qui affichent Deep Work Focus sont reconnus et épargnés.
 
 ## Données
-Elles sont stockées dans `%APPDATA%\DeepWorkFocus\` : `config.json` (listes), `sessions.json` (historique) et `state.json` (session en cours).
+Elles sont stockées dans `%APPDATA%\DeepWorkFocus\` : `config.json` (listes et réglages), `sessions.json` (historique), `apps.json` (cache des applications) et `state.json` (session en cours).
 
 ## Limites
-- Les applications sont fermées de force : ce qui n'est pas enregistré dans ces applications est perdu.
-- Si un navigateur était déjà ouvert sur un site bloqué, il peut garder ce site en cache. Il faut fermer et rouvrir l'onglet. Si le « DNS sécurisé » est activé dans Chrome ou Edge, le blocage peut être contourné : désactive-le dans les paramètres.
-- Si des notifications passent encore, active aussi « Ne pas déranger » de Windows (Win + N).
+- Les applications sont fermées de force : ce qui n'y est pas enregistré est perdu.
+- Si un site reste accessible, ferme et rouvre son onglet. Si le « DNS sécurisé » est activé dans le navigateur, le blocage peut être contourné : désactive-le.
+- Si des notifications passent encore, active aussi « Ne pas déranger » (Win + N).

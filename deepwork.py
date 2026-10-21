@@ -1,50 +1,64 @@
 """
 Deep Work Focus — bloqueur de distractions inspiré de « Deep Work » (Cal Newport).
 
+Le moteur (ce fichier) applique les blocages et sert l'interface (dossier ui/) sur
+127.0.0.1. L'interface s'ouvre dans une fenêtre Edge en mode application.
+
 Pendant une session :
   - coupe les notifications Windows (toasts),
-  - ferme automatiquement les applications de la liste noire,
-  - bloque les sites de la liste noire via le fichier hosts (nécessite les droits admin).
+  - ferme automatiquement les applications cochées,
+  - bloque les sites cochés via le fichier hosts (nécessite les droits admin).
 
-Tout est restauré à la fin de la session, y compris après un plantage (au prochain lancement).
+Fermer la fenêtre n'arrête pas la session : le moteur continue en arrière-plan et
+rouvre la fenêtre à la fin. Après un plantage, tout est repris ou restauré au lancement.
 """
 
 import ctypes
 import datetime as dt
 import json
 import os
-import queue
-import random
+import re
+import secrets
 import subprocess
 import sys
 import threading
 import time
-import tkinter as tk
+import urllib.request
+import webbrowser
 import winreg
 import winsound
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from tkinter import messagebox, ttk
 
 APP_NAME = "Deep Work Focus"
+ROOT = Path(__file__).resolve().parent
+UI_DIR = ROOT / "ui"
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "DeepWorkFocus"
 CONFIG_FILE = APP_DIR / "config.json"
 SESSIONS_FILE = APP_DIR / "sessions.json"
 STATE_FILE = APP_DIR / "state.json"
+APPS_CACHE = APP_DIR / "apps.json"
+SERVER_FILE = APP_DIR / "server.json"
+WINDOW_PROFILE = APP_DIR / "fenetre"
 HOSTS_FILE = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
 
 HOSTS_START = "# >>> DeepWorkFocus (ne pas modifier)"
 HOSTS_END = "# <<< DeepWorkFocus"
 CREATE_NO_WINDOW = 0x08000000
 ABANDON_PHRASE = "j'abandonne ma session de deep work"
+IDLE_EXIT_SECONDS = 25
 
 NOTIF_KEYS = [
     (r"Software\Microsoft\Windows\CurrentVersion\PushNotifications", "ToastEnabled"),
     (r"Software\Microsoft\Windows\CurrentVersion\Notifications\Settings", "NOC_GLOBAL_SETTING_TOASTS_ENABLED"),
 ]
 
-# Processus qu'on ne tue jamais, même s'ils sont ajoutés par erreur à la liste.
-PROTECTED = {"explorer.exe", "python.exe", "pythonw.exe", "svchost.exe", "csrss.exe",
-             "winlogon.exe", "dwm.exe", "taskmgr.exe", "system", "lsass.exe"}
+# Processus qu'on ne tue jamais.
+PROTECTED = {"explorer.exe", "python.exe", "pythonw.exe", "svchost.exe", "csrss.exe", "winlogon.exe",
+             "dwm.exe", "taskmgr.exe", "system", "lsass.exe", "msedgewebview2.exe",
+             "conhost.exe", "powershell.exe", "searchhost.exe", "startmenuexperiencehost.exe"}
+# Navigateurs pouvant afficher la fenêtre de l'application (par ordre de préférence).
+WINDOW_BROWSERS = ("msedge.exe", "chrome.exe", "brave.exe")
 
 DEFAULT_CONFIG = {
     "apps": ["discord.exe", "slack.exe", "whatsapp.exe", "telegram.exe", "steam.exe",
@@ -53,58 +67,42 @@ DEFAULT_CONFIG = {
               "youtube.com", "reddit.com", "netflix.com", "twitch.tv", "linkedin.com",
               "snapchat.com", "pinterest.com"],
     "weekly_goal_hours": 15,
+    "default_minutes": 90,
     "shutdown_checklist": [
-        "J'ai vérifié mes e-mails une dernière fois",
+        "J'ai vérifié mes e-mails et messages une dernière fois",
         "J'ai noté chaque tâche en suspens dans ma liste",
         "J'ai relu mon agenda des prochains jours",
         "J'ai planifié les blocs de deep work de demain",
     ],
 }
 
-QUOTES = [
-    "« Une heure de travail profond vaut mieux qu'une journée de travail dispersé. »",
-    "« Le travail profond est à la fois rare et précieux. »",
-    "« Ce qu'on accomplit est le produit du temps passé × l'intensité de la concentration. »",
-    "« L'ennui n'est pas l'ennemi : c'est l'entraînement de ta concentration. »",
-    "« Programme chaque minute de ta journée. »",
-    "« Quand tu travailles, travaille dur. Quand tu as fini, arrête. »",
-    "« Le cerveau a besoin de pauses de la distraction, pas de pauses de la concentration. »",
-]
+# --- Classement des applications installées -----------------------------------
+CATEGORY_WORDS = {
+    "social": ["discord", "whatsapp", "telegram", "messenger", "signal", "instagram", "facebook", "snapchat",
+               "tiktok", "twitter", "slack", "skype", "wechat", "viber", "threads", "reddit", "mastodon",
+               "bluesky", "linkedin", "pinterest", "teams"],
+    "games": ["steam", "epic games", "epicgameslauncher", "battle.net", "riot", "league of legends", "valorant",
+              "xbox", "solitaire", "candy crush", "roblox", "minecraft", "ubisoft", "ea", "origin", "gog galaxy",
+              "playnite", "fortnite", "itch", "rockstar", "game", "games", "jeu", "jeux", "overwolf"],
+    "media": ["spotify", "netflix", "youtube", "prime video", "disney", "twitch", "deezer", "vlc", "plex",
+              "kodi", "crunchyroll", "molotov", "apple tv", "apple music", "music", "musique", "films",
+              "movies", "tv", "podcast"],
+    "browsers": ["chrome", "firefox", "opera", "brave", "vivaldi", "tor browser", "arc", "navigation privée"],
+}
+SKIP_NAME = ("uninstall", "désinstall", "desinstall", "setup", "installer", "reset", "readme", "help",
+             "aide", "documentation", "module docs", "command prompt", "invite de commandes",
+             "release notes", "native tools", "cross tools", "developer powershell", "notifier")
+SKIP_EXE = {"cmd.exe", "pwsh.exe", "msiexec.exe", "setup.exe", "uninstall.exe", "uninst.exe",
+            "rundll32.exe", "appvlp.exe", "setlang.exe", "wscript.exe"}
 
-PRINCIPES = """RÈGLE N°1 — TRAVAILLER EN PROFONDEUR
-Choisis ta philosophie :
-  • Monastique : tu élimines presque toutes les distractions, en permanence.
-  • Bimodale : tu alternes des périodes entières de deep work (des jours, des semaines) et le reste.
-  • Rythmique : un bloc de deep work chaque jour, à la même heure. C'est la plus simple à tenir.
-  • Journalistique : tu te glisses en deep work dès qu'un créneau se libère (demande de l'entraînement).
-Ritualise : un lieu fixe, une durée fixe, des règles fixes (pas d'Internet, pas de téléphone).
-Applique la 4DX : vise un objectif ambitieux, mesure tes heures (le Tableau de score), rends des comptes chaque semaine.
 
-RÈGLE N°2 — ACCEPTER L'ENNUI
-Ne fais pas des pauses dans ta concentration : fais des pauses dans la distraction.
-Programme à l'avance les moments où tu as le droit d'aller sur Internet, et respecte-les.
-Si tu ne tiens pas l'ennui cinq minutes dans une file d'attente, tu ne tiendras pas une heure de réflexion.
-
-RÈGLE N°3 — QUITTER LES RÉSEAUX SOCIAUX
-Garde un outil seulement si ses bénéfices pour ce qui compte vraiment dépassent clairement ses coûts.
-Fais le test des 30 jours : arrête. Est-ce que ça t'a manqué ? Est-ce que quelqu'un l'a remarqué ?
-
-RÈGLE N°4 — ASSÉCHER LES EAUX PEU PROFONDES
-Programme chaque minute de ta journée en blocs.
-Demande-toi combien de mois un jeune diplômé brillant mettrait à apprendre à faire cette tâche : plus c'est court, plus elle est superficielle.
-Fixe un budget pour le travail superficiel, et termine ta journée par un rituel de fin.
-"""
-
-# --- Palette -------------------------------------------------------------------
-BG = "#0f1115"
-SURFACE = "#171a21"
-SURFACE_2 = "#1f232c"
-TEXT = "#e8e6e1"
-MUTED = "#8b909c"
-ACCENT = "#d4a256"
-ACCENT_DIM = "#8a6a3a"
-DANGER = "#c9605a"
-OK = "#6fae7f"
+def categorize(name: str, exe: str) -> str:
+    haystack = f"{name} {exe.removesuffix('.exe')}".lower()
+    for category, words in CATEGORY_WORDS.items():
+        for word in words:
+            if re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", haystack):
+                return category
+    return "other"
 
 
 # --- Persistance ---------------------------------------------------------------
@@ -136,13 +134,15 @@ def is_admin() -> bool:
         return False
 
 
-def relaunch_as_admin() -> bool:
+def pythonw() -> str:
     exe = Path(sys.executable)
-    pythonw = exe.with_name("pythonw.exe")
-    if pythonw.exists():
-        exe = pythonw
-    rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", str(exe), f'"{Path(__file__).resolve()}"', None, 1)
-    return rc > 32
+    alt = exe.with_name("pythonw.exe")
+    return str(alt if alt.exists() else exe)
+
+
+def relaunch_as_admin() -> bool:
+    args = f'"{Path(__file__).resolve()}" --replace'
+    return ctypes.windll.shell32.ShellExecuteW(None, "runas", pythonw(), args, str(ROOT), 1) > 32
 
 
 def _read_dword(path: str, name: str):
@@ -179,6 +179,11 @@ def notifications_restore(previous: dict) -> None:
             pass
 
 
+def clean_domain(site: str) -> str:
+    site = site.strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
+    return site.removeprefix("www.")
+
+
 def strip_hosts_block(content: str) -> str:
     out, skipping = [], False
     for line in content.splitlines():
@@ -196,8 +201,7 @@ def strip_hosts_block(content: str) -> str:
 def build_hosts_block(sites: list[str]) -> str:
     lines = [HOSTS_START]
     for site in sites:
-        site = site.strip().lower().removeprefix("https://").removeprefix("http://").split("/")[0]
-        site = site.removeprefix("www.")
+        site = clean_domain(site)
         if not site:
             continue
         for host in (site, f"www.{site}", f"m.{site}"):
@@ -224,434 +228,173 @@ def unblock_sites(hosts: Path = HOSTS_FILE) -> None:
         flush_dns()
 
 
+class _ProcessEntry(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_ulong), ("cntUsage", ctypes.c_ulong), ("th32ProcessID", ctypes.c_ulong),
+                ("th32DefaultHeapID", ctypes.c_size_t), ("th32ModuleID", ctypes.c_ulong),
+                ("cntThreads", ctypes.c_ulong), ("th32ParentProcessID", ctypes.c_ulong),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", ctypes.c_ulong), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+class _UnicodeString(ctypes.Structure):
+    _fields_ = [("Length", ctypes.c_ushort), ("MaximumLength", ctypes.c_ushort), ("Buffer", ctypes.c_void_p)]
+
+
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+_kernel32.OpenProcess.restype = ctypes.c_void_p
+_kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+_kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+_kernel32.Process32FirstW.argtypes = _kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_ntdll = ctypes.WinDLL("ntdll")
+_ntdll.NtQueryInformationProcess.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong,
+                                             ctypes.POINTER(ctypes.c_ulong)]
+
+
+def list_processes() -> list[tuple[int, str]]:
+    """(pid, nom en minuscules) de tous les processus, sans lancer de commande externe."""
+    snap = _kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snap or snap == ctypes.c_void_p(-1).value:
+        return []
+    out = []
+    try:
+        entry = _ProcessEntry()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry)
+        ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            out.append((entry.th32ProcessID, entry.szExeFile.lower()))
+            ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        _kernel32.CloseHandle(snap)
+    return out
+
+
+def process_command_line(pid: int) -> str:
+    handle = _kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return ""
+    try:
+        size = ctypes.c_ulong(0)
+        _ntdll.NtQueryInformationProcess(handle, 60, None, 0, ctypes.byref(size))  # ProcessCommandLineInformation
+        if not size.value:
+            return ""
+        buf = ctypes.create_string_buffer(size.value)
+        if _ntdll.NtQueryInformationProcess(handle, 60, buf, size, ctypes.byref(size)) != 0:
+            return ""
+        us = _UnicodeString.from_buffer(buf)
+        return ctypes.wstring_at(us.Buffer, us.Length // 2) if us.Buffer else ""
+    finally:
+        _kernel32.CloseHandle(handle)
+
+
 def running_processes() -> set[str]:
-    result = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True,
-                            errors="ignore", creationflags=CREATE_NO_WINDOW)
-    names = set()
-    for line in result.stdout.splitlines():
-        if line.startswith('"'):
-            names.add(line.split('","', 1)[0].strip('"').lower())
-    return names
+    return {name for _, name in list_processes()}
 
 
 def kill_blocked(apps: list[str]) -> list[str]:
     targets = {a.strip().lower() for a in apps if a.strip()} - PROTECTED
-    killed = []
-    for name in sorted(running_processes() & targets):
-        subprocess.run(["taskkill", "/F", "/IM", name], capture_output=True, creationflags=CREATE_NO_WINDOW)
-        killed.append(name)
-    return killed
+    marker = str(WINDOW_PROFILE).lower()
+    killed = set()
+    for pid, name in list_processes():
+        if name not in targets:
+            continue
+        # Le navigateur qui affiche Deep Work Focus est épargné : on reconnaît son profil dédié.
+        if name in WINDOW_BROWSERS and marker in process_command_line(pid).lower():
+            continue
+        handle = _kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+        if handle:
+            if _kernel32.TerminateProcess(handle, 1):
+                killed.add(name)
+            _kernel32.CloseHandle(handle)
+    return sorted(killed)
 
 
-# --- Application ---------------------------------------------------------------
-class DeepWorkApp:
-    def __init__(self, root: tk.Tk):
-        self.root = root
+def scan_installed_apps(refresh: bool = False) -> list[dict]:
+    """Applications du menu Démarrer et du Microsoft Store, dédoublonnées par processus."""
+    if not refresh:
+        cached = load_json(APPS_CACHE, None)
+        if cached:
+            return cached
+    result = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                             str(ROOT / "scan_apps.ps1")], capture_output=True, creationflags=CREATE_NO_WINDOW)
+    try:
+        raw = json.loads(result.stdout.decode("utf-8-sig", errors="ignore") or "[]")
+    except ValueError:
+        raw = []
+    if isinstance(raw, dict):
+        raw = [raw]
+    sysroot = os.environ.get("SystemRoot", r"C:\Windows").lower()
+    by_exe: dict[str, dict] = {}
+    for item in raw:
+        exe, name = (item.get("exe") or "").lower(), (item.get("name") or "").strip()
+        if not exe or not name or exe in SKIP_EXE or exe in PROTECTED or exe.startswith("unins"):
+            continue
+        if any(word in name.lower() for word in SKIP_NAME):
+            continue
+        if (item.get("path") or "").lower().startswith(sysroot):
+            continue
+        current = by_exe.get(exe)
+        if current is None or len(name) < len(current["name"]):
+            by_exe[exe] = {"name": name, "exe": exe, "icon": item.get("icon") or (current or {}).get("icon", ""),
+                           "category": categorize(name, exe)}
+    apps = sorted(by_exe.values(), key=lambda a: a["name"].casefold())
+    if apps:
+        save_json(APPS_CACHE, apps)
+    return apps
+
+
+def find_window_browser() -> Path | None:
+    """Un navigateur Chromium capable d'ouvrir une fenêtre en mode application."""
+    for exe in WINDOW_BROWSERS:
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(hive, rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}") as key:
+                    path = Path(winreg.QueryValueEx(key, "")[0].strip('"'))
+                if path.is_file():
+                    return path
+            except OSError:
+                pass
+    roots = [os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+             os.environ.get("ProgramFiles", r"C:\Program Files"), os.environ.get("LOCALAPPDATA", "")]
+    for sub in (r"Microsoft\Edge\Application\msedge.exe", r"Google\Chrome\Application\chrome.exe",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe"):
+        for root in roots:
+            path = Path(root) / sub
+            if root and path.is_file():
+                return path
+    return None
+
+
+def open_window(url: str) -> None:
+    browser = find_window_browser()
+    if browser:
+        subprocess.Popen([str(browser), f"--app={url}", f"--user-data-dir={WINDOW_PROFILE}",
+                          "--no-first-run", "--no-default-browser-check", "--window-size=1180,820",
+                          "--disable-features=Translate", "--disable-sync"])
+    else:
+        webbrowser.open(url)
+
+
+# --- Moteur --------------------------------------------------------------------
+class ApiError(Exception):
+    pass
+
+
+class Engine:
+    def __init__(self):
+        self.lock = threading.RLock()
         self.config = load_config()
         self.sessions = load_json(SESSIONS_FILE, [])
         self.admin = is_admin()
-        self.state: dict | None = None
-        self.events: queue.Queue = queue.Queue()
-        self.enforcer: threading.Thread | None = None
-        self.stop_flag = threading.Event()
-
-        root.title(APP_NAME + ("  ·  administrateur" if self.admin else ""))
-        root.geometry("760x640")
-        root.minsize(680, 580)
-        root.configure(bg=BG)
-        root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        self._style()
-        self._build()
+        self.session: dict | None = None
+        self.review_id: str | None = None
+        self.last_seen = time.time()
+        self.url = ""
+        self.on_idle = None
+        self.notice = ""
         self._recover()
-        self._tick()
 
-    # ----- Style
-    def _style(self):
-        s = ttk.Style(self.root)
-        s.theme_use("clam")
-        s.configure(".", background=BG, foreground=TEXT, font=("Segoe UI", 10), borderwidth=0)
-        s.configure("TNotebook", background=BG, tabmargins=(12, 10, 12, 0))
-        s.configure("TNotebook.Tab", background=SURFACE, foreground=MUTED, padding=(16, 8), font=("Segoe UI", 10))
-        s.map("TNotebook.Tab", background=[("selected", SURFACE_2)], foreground=[("selected", ACCENT)])
-        s.configure("TFrame", background=BG)
-        s.configure("Card.TFrame", background=SURFACE)
-        s.configure("TLabel", background=BG, foreground=TEXT)
-        s.configure("Card.TLabel", background=SURFACE, foreground=TEXT)
-        s.configure("Muted.TLabel", background=BG, foreground=MUTED)
-        s.configure("CardMuted.TLabel", background=SURFACE, foreground=MUTED)
-        s.configure("H1.TLabel", background=BG, foreground=TEXT, font=("Segoe UI Semibold", 16))
-        s.configure("Timer.TLabel", background=BG, foreground=ACCENT, font=("Segoe UI Light", 64))
-        s.configure("TCheckbutton", background=SURFACE, foreground=TEXT, focuscolor=SURFACE)
-        s.map("TCheckbutton", background=[("active", SURFACE)], foreground=[("disabled", MUTED)])
-        s.configure("TRadiobutton", background=SURFACE, foreground=TEXT, focuscolor=SURFACE)
-        s.map("TRadiobutton", background=[("active", SURFACE)])
-        s.configure("TButton", background=SURFACE_2, foreground=TEXT, padding=(14, 8))
-        s.map("TButton", background=[("active", "#2a2f3a"), ("disabled", SURFACE)], foreground=[("disabled", MUTED)])
-        s.configure("Accent.TButton", background=ACCENT, foreground="#1a1408", font=("Segoe UI Semibold", 11), padding=(20, 10))
-        s.map("Accent.TButton", background=[("active", "#e0b56c"), ("disabled", ACCENT_DIM)])
-        s.configure("Danger.TButton", background=SURFACE_2, foreground=DANGER)
-        s.configure("Horizontal.TProgressbar", troughcolor=SURFACE, background=ACCENT, thickness=6)
-        s.configure("TEntry", fieldbackground=SURFACE_2, foreground=TEXT, insertcolor=TEXT, padding=6)
-        s.configure("TSpinbox", fieldbackground=SURFACE_2, foreground=TEXT, arrowcolor=TEXT, padding=4)
-
-    def _text(self, parent, height=10):
-        return tk.Text(parent, height=height, bg=SURFACE_2, fg=TEXT, insertbackground=TEXT, relief="flat",
-                       font=("Consolas", 10), padx=8, pady=6, highlightthickness=0, wrap="word")
-
-    # ----- Construction
-    def _build(self):
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True)
-        self.nb = nb
-        self.tab_session = ttk.Frame(nb, padding=20)
-        self.tab_block = ttk.Frame(nb, padding=20)
-        self.tab_score = ttk.Frame(nb, padding=20)
-        self.tab_ritual = ttk.Frame(nb, padding=20)
-        self.tab_rules = ttk.Frame(nb, padding=20)
-        nb.add(self.tab_session, text="Session")
-        nb.add(self.tab_block, text="Listes de blocage")
-        nb.add(self.tab_score, text="Tableau de score")
-        nb.add(self.tab_ritual, text="Rituel de fin")
-        nb.add(self.tab_rules, text="Les 4 règles")
-        nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_score())
-        self._build_session()
-        self._build_block()
-        self._build_score()
-        self._build_ritual()
-        self._build_rules()
-
-    def _build_session(self):
-        f = self.tab_session
-        # Vue « préparation »
-        self.setup = ttk.Frame(f)
-        self.setup.pack(fill="both", expand=True)
-
-        ttk.Label(self.setup, text="Nouvelle session de travail profond", style="H1.TLabel").pack(anchor="w")
-        ttk.Label(self.setup, text=random.choice(QUOTES), style="Muted.TLabel", wraplength=680).pack(anchor="w", pady=(4, 16))
-
-        card = ttk.Frame(self.setup, style="Card.TFrame", padding=16)
-        card.pack(fill="x")
-        ttk.Label(card, text="Intention : que vas-tu accomplir précisément ?", style="Card.TLabel").pack(anchor="w")
-        self.intention = tk.StringVar()
-        ttk.Entry(card, textvariable=self.intention, font=("Segoe UI", 11)).pack(fill="x", pady=(6, 14))
-
-        ttk.Label(card, text="Durée", style="Card.TLabel").pack(anchor="w")
-        row = ttk.Frame(card, style="Card.TFrame")
-        row.pack(fill="x", pady=(6, 14))
-        self.duration = tk.IntVar(value=90)
-        for m in (25, 50, 90, 120, 180):
-            ttk.Radiobutton(row, text=f"{m} min", value=m, variable=self.duration).pack(side="left", padx=(0, 14))
-        ttk.Label(row, text="ou", style="CardMuted.TLabel").pack(side="left", padx=(0, 8))
-        ttk.Spinbox(row, from_=5, to=480, increment=5, width=5, textvariable=self.duration).pack(side="left")
-        ttk.Label(row, text="min", style="CardMuted.TLabel").pack(side="left", padx=4)
-
-        ttk.Label(card, text="Protection", style="Card.TLabel").pack(anchor="w")
-        self.opt_notif = tk.BooleanVar(value=True)
-        self.opt_apps = tk.BooleanVar(value=True)
-        self.opt_sites = tk.BooleanVar(value=self.admin)
-        self.opt_lock = tk.BooleanVar(value=False)
-        ttk.Checkbutton(card, text="Couper les notifications Windows", variable=self.opt_notif).pack(anchor="w", pady=2)
-        ttk.Checkbutton(card, text="Fermer les applications de la liste noire", variable=self.opt_apps).pack(anchor="w", pady=2)
-        site_row = ttk.Frame(card, style="Card.TFrame")
-        site_row.pack(fill="x", pady=2)
-        cb = ttk.Checkbutton(site_row, text="Bloquer les sites de la liste noire", variable=self.opt_sites)
-        cb.pack(side="left")
-        if not self.admin:
-            cb.state(["disabled"])
-            ttk.Label(site_row, text="  (nécessite les droits administrateur)", style="CardMuted.TLabel").pack(side="left")
-            ttk.Button(site_row, text="Relancer en admin", command=self.elevate).pack(side="right")
-        ttk.Checkbutton(card, text="Mode engagement : impossible d'arrêter avant la fin sans taper une phrase d'abandon",
-                        variable=self.opt_lock).pack(anchor="w", pady=(8, 2))
-
-        ttk.Button(self.setup, text="Commencer la session", style="Accent.TButton", command=self.start).pack(pady=20)
-
-        # Vue « en cours »
-        self.live = ttk.Frame(f)
-        ttk.Label(self.live, text="Travail profond en cours", style="Muted.TLabel").pack(pady=(30, 0))
-        self.lbl_intention = ttk.Label(self.live, text="", style="H1.TLabel", wraplength=640, justify="center")
-        self.lbl_intention.pack(pady=(6, 10))
-        self.lbl_timer = ttk.Label(self.live, text="00:00", style="Timer.TLabel")
-        self.lbl_timer.pack()
-        self.progress = ttk.Progressbar(self.live, length=460, mode="determinate")
-        self.progress.pack(pady=(8, 16))
-        self.lbl_status = ttk.Label(self.live, text="", style="Muted.TLabel", justify="center")
-        self.lbl_status.pack()
-        self.lbl_blocked = ttk.Label(self.live, text="", style="Muted.TLabel", wraplength=600, justify="center")
-        self.lbl_blocked.pack(pady=(10, 0))
-        ttk.Button(self.live, text="Arrêter la session", style="Danger.TButton", command=self.request_stop).pack(pady=30)
-
-    def _build_block(self):
-        f = self.tab_block
-        ttk.Label(f, text="Ce qui est bloqué pendant une session", style="H1.TLabel").pack(anchor="w")
-        ttk.Label(f, text="Une entrée par ligne. Applications : le nom du processus (ex. discord.exe). Sites : le domaine (ex. youtube.com).",
-                  style="Muted.TLabel", wraplength=680).pack(anchor="w", pady=(4, 12))
-        cols = ttk.Frame(f)
-        cols.pack(fill="both", expand=True)
-        cols.columnconfigure(0, weight=1)
-        cols.columnconfigure(1, weight=1)
-        cols.rowconfigure(1, weight=1)
-        ttk.Label(cols, text="Applications").grid(row=0, column=0, sticky="w")
-        ttk.Label(cols, text="Sites web").grid(row=0, column=1, sticky="w", padx=(12, 0))
-        self.txt_apps = self._text(cols)
-        self.txt_apps.grid(row=1, column=0, sticky="nsew", pady=6)
-        self.txt_sites = self._text(cols)
-        self.txt_sites.grid(row=1, column=1, sticky="nsew", pady=6, padx=(12, 0))
-        self.txt_apps.insert("1.0", "\n".join(self.config["apps"]))
-        self.txt_sites.insert("1.0", "\n".join(self.config["sites"]))
-
-        btns = ttk.Frame(f)
-        btns.pack(fill="x", pady=(8, 0))
-        ttk.Button(btns, text="Enregistrer", style="Accent.TButton", command=self.save_lists).pack(side="left")
-        ttk.Button(btns, text="Choisir parmi les applications ouvertes…", command=self.pick_running).pack(side="left", padx=10)
-        self.lbl_saved = ttk.Label(btns, text="", style="Muted.TLabel")
-        self.lbl_saved.pack(side="left", padx=10)
-
-    def _build_score(self):
-        f = self.tab_score
-        top = ttk.Frame(f)
-        top.pack(fill="x")
-        ttk.Label(top, text="Tableau de score (4DX)", style="H1.TLabel").pack(side="left")
-        ttk.Label(top, text="h / semaine", style="Muted.TLabel").pack(side="right")
-        self.goal = tk.IntVar(value=self.config["weekly_goal_hours"])
-        sp = ttk.Spinbox(top, from_=1, to=60, width=4, textvariable=self.goal, command=self.save_goal)
-        sp.pack(side="right", padx=6)
-        sp.bind("<FocusOut>", lambda e: self.save_goal())
-        ttk.Label(top, text="Objectif :", style="Muted.TLabel").pack(side="right")
-
-        self.lbl_week = ttk.Label(f, text="", style="Muted.TLabel")
-        self.lbl_week.pack(anchor="w", pady=(6, 8))
-        self.canvas = tk.Canvas(f, height=220, bg=SURFACE, highlightthickness=0)
-        self.canvas.pack(fill="x")
-        self.canvas.bind("<Configure>", lambda e: self.refresh_score())
-        ttk.Label(f, text="Dernières sessions", style="Muted.TLabel").pack(anchor="w", pady=(16, 4))
-        self.txt_history = self._text(f, height=8)
-        self.txt_history.pack(fill="both", expand=True)
-
-    def _build_ritual(self):
-        f = self.tab_ritual
-        ttk.Label(f, text="Rituel de fin de journée", style="H1.TLabel").pack(anchor="w")
-        ttk.Label(f, text="Ton cerveau ne lâche prise que s'il sait que rien n'est oublié. Coche chaque étape, puis dis-le : « Shutdown complete ».",
-                  style="Muted.TLabel", wraplength=680).pack(anchor="w", pady=(4, 14))
-        card = ttk.Frame(f, style="Card.TFrame", padding=16)
-        card.pack(fill="x")
-        self.ritual_vars = []
-        for item in self.config["shutdown_checklist"]:
-            v = tk.BooleanVar()
-            ttk.Checkbutton(card, text=item, variable=v, command=self._ritual_check).pack(anchor="w", pady=4)
-            self.ritual_vars.append(v)
-        self.btn_shutdown = ttk.Button(f, text="Shutdown complete", style="Accent.TButton", command=self.shutdown_complete)
-        self.btn_shutdown.pack(pady=20)
-        self.btn_shutdown.state(["disabled"])
-        self.lbl_ritual = ttk.Label(f, text="", style="Muted.TLabel", wraplength=680, justify="center")
-        self.lbl_ritual.pack()
-        if self.config.get("last_shutdown") == dt.date.today().isoformat():
-            self.lbl_ritual.configure(text="Rituel déjà accompli aujourd'hui. Ta journée de travail est terminée.")
-
-    def _build_rules(self):
-        t = self._text(self.tab_rules, height=30)
-        t.configure(font=("Segoe UI", 10), spacing1=2, spacing3=2)
-        t.pack(fill="both", expand=True)
-        t.insert("1.0", PRINCIPES)
-        t.tag_configure("h", foreground=ACCENT, font=("Segoe UI Semibold", 11))
-        for i, line in enumerate(PRINCIPES.splitlines(), start=1):
-            if line.startswith("RÈGLE"):
-                t.tag_add("h", f"{i}.0", f"{i}.end")
-        t.configure(state="disabled")
-
-    # ----- Session
-    def start(self):
-        try:
-            minutes = int(self.duration.get())
-        except (tk.TclError, ValueError):
-            minutes = 0
-        if not 5 <= minutes <= 480:
-            messagebox.showwarning(APP_NAME, "Choisis une durée entre 5 et 480 minutes.")
-            return
-        intention = self.intention.get().strip()
-        if not intention:
-            messagebox.showwarning(APP_NAME, "Écris ton intention. Une session sans objectif précis, c'est du travail superficiel.")
-            return
-        now = time.time()
-        self.state = {
-            "active": True, "start": now, "end": now + minutes * 60, "planned_min": minutes,
-            "intention": intention, "notif": self.opt_notif.get(), "apps": self.opt_apps.get(),
-            "sites": self.opt_sites.get() and self.admin, "lock": self.opt_lock.get(),
-            "notif_prev": {}, "blocked_count": 0,
-        }
-        self._apply_blocks()
-        self._show_live()
-
-    def _apply_blocks(self):
-        errors = []
-        st = self.state
-        if st["notif"] and not st["notif_prev"]:
-            try:
-                st["notif_prev"] = notifications_off()
-            except OSError as e:
-                errors.append(f"notifications : {e}")
-        save_json(STATE_FILE, st)  # sauvegardé avant de toucher au hosts, pour pouvoir tout restaurer
-        if st["sites"]:
-            try:
-                block_sites(self.config["sites"])
-            except OSError as e:
-                st["sites"] = False
-                errors.append(f"sites : {e}")
-        save_json(STATE_FILE, st)
-        if st["apps"]:
-            self.stop_flag.clear()
-            self.enforcer = threading.Thread(target=self._enforce, daemon=True)
-            self.enforcer.start()
-        if errors:
-            messagebox.showwarning(APP_NAME, "Certains blocages n'ont pas pu être activés :\n" + "\n".join(errors))
-
-    def _enforce(self):
-        apps = list(self.config["apps"])
-        while not self.stop_flag.is_set():
-            try:
-                killed = kill_blocked(apps)
-                if killed:
-                    self.events.put(killed)
-            except OSError:
-                pass
-            self.stop_flag.wait(2)
-
-    def _show_live(self):
-        st = self.state
-        self.setup.pack_forget()
-        self.live.pack(fill="both", expand=True)
-        self.lbl_intention.configure(text=st["intention"])
-        parts = []
-        if st["notif"]:
-            parts.append("notifications coupées")
-        if st["apps"]:
-            parts.append(f"{len(self.config['apps'])} applications bloquées")
-        if st["sites"]:
-            parts.append(f"{len(self.config['sites'])} sites bloqués")
-        if st["lock"]:
-            parts.append("mode engagement")
-        self.lbl_status.configure(text="  ·  ".join(parts) or "aucun blocage actif")
-        self.lbl_blocked.configure(text="")
-
-    def _tick(self):
-        if self.state:
-            while not self.events.empty():
-                killed = self.events.get()
-                self.state["blocked_count"] += len(killed)
-                self.lbl_blocked.configure(
-                    text=f"Fermé : {', '.join(killed)}. Reviens à ta tâche.\n"
-                         f"Tentatives de distraction bloquées : {self.state['blocked_count']}")
-            remaining = self.state["end"] - time.time()
-            if remaining <= 0:
-                self.finish(completed=True)
-            else:
-                m, s = divmod(int(remaining), 60)
-                h, m = divmod(m, 60)
-                self.lbl_timer.configure(text=f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}")
-                total = self.state["end"] - self.state["start"]
-                self.progress["value"] = 100 * (1 - remaining / total)
-        self.root.after(500, self._tick)
-
-    def request_stop(self):
-        if not self.state:
-            return
-        if self.state["lock"]:
-            self._abandon_dialog()
-        elif messagebox.askyesno(APP_NAME, "Arrêter la session maintenant ?\nLe temps déjà travaillé sera comptabilisé."):
-            self.finish(completed=False)
-
-    def _abandon_dialog(self):
-        win = tk.Toplevel(self.root, bg=BG, padx=20, pady=20)
-        win.title("Mode engagement")
-        win.transient(self.root)
-        win.grab_set()
-        ttk.Label(win, text="Tu t'es engagé à aller jusqu'au bout.", style="H1.TLabel").pack(anchor="w")
-        ttk.Label(win, text=f"Pour abandonner quand même, tape exactement :\n« {ABANDON_PHRASE} »",
-                  style="Muted.TLabel").pack(anchor="w", pady=10)
-        v = tk.StringVar()
-        e = ttk.Entry(win, textvariable=v, width=46)
-        e.pack(fill="x")
-        e.focus_set()
-
-        def confirm():
-            if v.get().strip().lower() == ABANDON_PHRASE:
-                win.destroy()
-                self.finish(completed=False)
-            else:
-                e.delete(0, "end")
-
-        row = ttk.Frame(win)
-        row.pack(fill="x", pady=(14, 0))
-        ttk.Button(row, text="Je reprends le travail", style="Accent.TButton", command=win.destroy).pack(side="left")
-        ttk.Button(row, text="Abandonner", style="Danger.TButton", command=confirm).pack(side="right")
-        e.bind("<Return>", lambda _: confirm())
-
-    def _release(self, st: dict):
-        """Retire tous les blocages décrits par un état de session."""
-        self.stop_flag.set()
-        if st.get("notif_prev"):
-            notifications_restore(st["notif_prev"])
-        if st.get("sites"):
-            try:
-                unblock_sites()
-            except OSError:
-                messagebox.showerror(APP_NAME, "Impossible de nettoyer le fichier hosts.\nRelance l'application en administrateur.")
-                return
-        try:
-            STATE_FILE.unlink()
-        except FileNotFoundError:
-            pass
-
-    def finish(self, completed: bool):
-        st, self.state = self.state, None
-        self._release(st)
-        actual = min(st["planned_min"], (time.time() - st["start"]) / 60)
-        self.live.pack_forget()
-        self.setup.pack(fill="both", expand=True)
-        winsound.MessageBeep(winsound.MB_ICONASTERISK)
-        self.root.deiconify()
-        self.root.lift()
-        self.root.attributes("-topmost", True)
-        self.root.after(300, lambda: self.root.attributes("-topmost", False))
-        self._review_dialog(st, actual, completed)
-
-    def _review_dialog(self, st, actual, completed):
-        win = tk.Toplevel(self.root, bg=BG, padx=20, pady=20)
-        win.title("Bilan de la session")
-        win.transient(self.root)
-        win.grab_set()
-        title = "Session terminée. Bravo." if completed else "Session interrompue."
-        ttk.Label(win, text=title, style="H1.TLabel").pack(anchor="w")
-        ttk.Label(win, text=f"{actual:.0f} min de travail sur « {st['intention']} »", style="Muted.TLabel",
-                  wraplength=420).pack(anchor="w", pady=(4, 12))
-        ttk.Label(win, text="Profondeur de ta concentration (1 = dispersé, 5 = immersion totale)").pack(anchor="w")
-        depth = tk.IntVar(value=4)
-        row = ttk.Frame(win)
-        row.pack(anchor="w", pady=6)
-        for i in range(1, 6):
-            tk.Radiobutton(row, text=str(i), value=i, variable=depth, bg=BG, fg=TEXT, selectcolor=SURFACE_2,
-                           activebackground=BG, activeforeground=ACCENT, font=("Segoe UI", 11)).pack(side="left", padx=6)
-        ttk.Label(win, text="Note (ce qui a marché, ce qui t'a distrait)").pack(anchor="w", pady=(8, 2))
-        note = tk.StringVar()
-        ttk.Entry(win, textvariable=note, width=50).pack(fill="x")
-
-        def save():
-            self.sessions.append({
-                "start": dt.datetime.fromtimestamp(st["start"]).isoformat(timespec="minutes"),
-                "planned_min": st["planned_min"], "actual_min": round(actual, 1),
-                "intention": st["intention"], "completed": completed, "depth": depth.get(),
-                "note": note.get().strip(), "blocked": st.get("blocked_count", 0),
-            })
-            save_json(SESSIONS_FILE, self.sessions)
-            win.destroy()
-            self.intention.set("")
-            self.nb.select(self.tab_score)
-
-        ttk.Button(win, text="Enregistrer", style="Accent.TButton", command=save).pack(pady=(14, 0))
-        win.protocol("WM_DELETE_WINDOW", save)
-
+    # ----- Cycle de vie
     def _recover(self):
-        """Après un plantage ou une fermeture forcée : reprend ou nettoie la session laissée ouverte."""
         st = load_json(STATE_FILE, None)
         if not st or not st.get("active"):
             return
@@ -662,160 +405,325 @@ class DeepWorkApp:
                     unblock_sites()
                 except OSError:
                     pass
-            self.state = st
+            self.session = st
             self._apply_blocks()
-            self._show_live()
-            messagebox.showinfo(APP_NAME, "Ta session de deep work n'était pas terminée : elle reprend.")
+            self.notice = "Ta session n'était pas terminée : elle a repris là où tu l'avais laissée."
         else:
             self._release(st)
+            self._log_session(st, completed=True)
 
-    def on_close(self):
-        if self.state:
-            if self.state["lock"]:
-                self._abandon_dialog()
+    def run_forever(self):
+        while True:
+            time.sleep(1.5)
+            with self.lock:
+                st = self.session
+                apps = list(self.config["apps"]) if st and st.get("apps") else []
+                if st and time.time() >= st["end"]:
+                    self._finish(completed=True)
+                    continue
+                idle = not st and not self.review_id and time.time() - self.last_seen > IDLE_EXIT_SECONDS
+            if idle and self.on_idle:
+                self.on_idle()
                 return
-            if not messagebox.askyesno(APP_NAME, "Une session est en cours. Arrêter et quitter ?"):
+            if apps:
+                try:
+                    killed = kill_blocked(apps)
+                except OSError:
+                    killed = []
+                if killed:
+                    with self.lock:
+                        if self.session:
+                            self.session["blocked_count"] += len(killed)
+                            self.session["last_killed"] = {"names": killed, "at": time.time()}
+
+    # ----- Blocages
+    def _apply_blocks(self):
+        st = self.session
+        errors = []
+        if st["notif"] and not st.get("notif_prev"):
+            try:
+                st["notif_prev"] = notifications_off()
+            except OSError as e:
+                errors.append(f"Notifications : {e}")
+        save_json(STATE_FILE, st)  # écrit avant le hosts, pour pouvoir tout restaurer après un plantage
+        if st["sites"]:
+            try:
+                block_sites(self.config["sites"])
+            except OSError as e:
+                st["sites"] = False
+                errors.append(f"Sites : {e}")
+        save_json(STATE_FILE, st)
+        return errors
+
+    def _release(self, st: dict):
+        if st.get("notif_prev"):
+            notifications_restore(st["notif_prev"])
+        if st.get("sites"):
+            try:
+                unblock_sites()
+            except OSError:
                 return
-            st, self.state = self.state, None
-            self._release(st)
-        self.root.destroy()
+        try:
+            STATE_FILE.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _log_session(self, st: dict, completed: bool) -> dict:
+        actual = max(0.0, min(st["planned_min"], (min(time.time(), st["end"]) - st["start"]) / 60))
+        entry = {
+            "id": st["id"], "start": dt.datetime.fromtimestamp(st["start"]).isoformat(timespec="minutes"),
+            "planned_min": st["planned_min"], "actual_min": round(actual, 1), "intention": st["intention"],
+            "completed": completed, "depth": None, "note": "", "blocked": st.get("blocked_count", 0),
+        }
+        self.sessions.append(entry)
+        save_json(SESSIONS_FILE, self.sessions)
+        return entry
+
+    def _finish(self, completed: bool):
+        st, self.session = self.session, None
+        self._release(st)
+        self._log_session(st, completed)
+        self.review_id = st["id"]
+        winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        if time.time() - self.last_seen > 4 and self.url:
+            open_window(self.url)
+
+    # ----- Actions de l'interface
+    def snapshot(self) -> dict:
+        self.last_seen = time.time()
+        with self.lock:
+            notice, self.notice = self.notice, ""
+            session = None
+            if self.session:
+                session = {k: self.session.get(k) for k in
+                           ("intention", "start", "end", "planned_min", "lock", "notif", "apps", "sites",
+                            "blocked_count", "last_killed")}
+            review = next((s for s in self.sessions if s["id"] == self.review_id), None) if self.review_id else None
+            return {
+                "now": time.time(), "admin": self.admin, "config": self.config, "session": session,
+                "review": review, "sessions": self.sessions, "notice": notice,
+                "today": dt.date.today().isoformat(), "abandon_phrase": ABANDON_PHRASE,
+            }
+
+    def start(self, data: dict):
+        with self.lock:
+            if self.session:
+                raise ApiError("Une session est déjà en cours.")
+            intention = str(data.get("intention", "")).strip()
+            minutes = int(data.get("minutes", 0))
+            if not intention:
+                raise ApiError("Écris ton intention avant de commencer.")
+            if not 5 <= minutes <= 480:
+                raise ApiError("Choisis une durée entre 5 et 480 minutes.")
+            now = time.time()
+            self.session = {
+                "id": secrets.token_hex(6), "active": True, "start": now, "end": now + minutes * 60,
+                "planned_min": minutes, "intention": intention[:200],
+                "notif": bool(data.get("notif")), "apps": bool(data.get("apps")),
+                "sites": bool(data.get("sites")) and self.admin, "lock": bool(data.get("lock")),
+                "notif_prev": {}, "blocked_count": 0, "last_killed": None,
+            }
+            self.review_id = None
+            self.config["default_minutes"] = minutes
+            save_json(CONFIG_FILE, self.config)
+            errors = self._apply_blocks()
+        if self.session.get("apps"):
+            threading.Thread(target=kill_blocked, args=(list(self.config["apps"]),), daemon=True).start()
+        return {"warnings": errors}
+
+    def stop(self, data: dict):
+        with self.lock:
+            if not self.session:
+                return {}
+            if self.session["lock"] and str(data.get("phrase", "")).strip().lower() != ABANDON_PHRASE:
+                raise ApiError("La phrase ne correspond pas. Ta session continue.")
+            self._finish(completed=False)
+        return {}
+
+    def review(self, data: dict):
+        with self.lock:
+            for s in self.sessions:
+                if s["id"] == data.get("id"):
+                    depth = data.get("depth")
+                    s["depth"] = int(depth) if depth in (1, 2, 3, 4, 5) else None
+                    s["note"] = str(data.get("note", "")).strip()[:500]
+            save_json(SESSIONS_FILE, self.sessions)
+            self.review_id = None
+        return {}
+
+    def update_config(self, data: dict):
+        with self.lock:
+            cfg = self.config
+            st = self.session
+            if "apps" in data:
+                apps = sorted({(a if a.endswith(".exe") else a + ".exe") for a in
+                               (str(x).strip().lower() for x in data["apps"]) if a} - PROTECTED)
+                if st and st["lock"] and not set(cfg["apps"]) <= set(apps):
+                    raise ApiError("Mode engagement : tu peux ajouter des blocages, pas en retirer.")
+                cfg["apps"] = apps
+            if "sites" in data:
+                sites = sorted({d for d in (clean_domain(str(x)) for x in data["sites"]) if "." in d})
+                if st and st["lock"] and not set(cfg["sites"]) <= set(sites):
+                    raise ApiError("Mode engagement : tu peux ajouter des blocages, pas en retirer.")
+                cfg["sites"] = sites
+                if st and st["sites"]:
+                    block_sites(sites)
+            if "weekly_goal_hours" in data:
+                cfg["weekly_goal_hours"] = max(1, min(80, int(data["weekly_goal_hours"])))
+            if "shutdown_checklist" in data:
+                cfg["shutdown_checklist"] = [str(x).strip()[:160] for x in data["shutdown_checklist"] if str(x).strip()]
+            if data.get("shutdown_done"):
+                cfg["last_shutdown"] = dt.date.today().isoformat()
+            save_json(CONFIG_FILE, cfg)
+        return {"config": self.config}
 
     def elevate(self):
-        if relaunch_as_admin():
-            self.root.destroy()
+        with self.lock:
+            if self.session:
+                raise ApiError("Termine d'abord ta session en cours.")
+        if not relaunch_as_admin():
+            raise ApiError("Élévation annulée.")
+        return {}
 
-    # ----- Listes
-    def save_lists(self):
-        def lines(t):
-            return [l.strip() for l in t.get("1.0", "end").splitlines() if l.strip()]
-        self.config["apps"] = [a.lower() if a.lower().endswith(".exe") else a.lower() + ".exe" for a in lines(self.txt_apps)]
-        self.config["sites"] = [s.lower() for s in lines(self.txt_sites)]
-        save_json(CONFIG_FILE, self.config)
-        self.txt_apps.delete("1.0", "end")
-        self.txt_apps.insert("1.0", "\n".join(self.config["apps"]))
-        msg = "Enregistré."
-        if self.state:
-            msg += " Les changements s'appliqueront à la prochaine session."
-        self.lbl_saved.configure(text=msg)
-        self.root.after(4000, lambda: self.lbl_saved.configure(text=""))
 
-    def pick_running(self):
-        win = tk.Toplevel(self.root, bg=BG, padx=16, pady=16)
-        win.title("Applications ouvertes")
-        win.transient(self.root)
-        ttk.Label(win, text="Double-clique pour ajouter à la liste noire").pack(anchor="w", pady=(0, 6))
-        lb = tk.Listbox(win, bg=SURFACE_2, fg=TEXT, selectbackground=ACCENT_DIM, relief="flat",
-                        highlightthickness=0, width=40, height=20, font=("Consolas", 10))
-        lb.pack(fill="both", expand=True)
-        for name in sorted(running_processes() - PROTECTED):
-            lb.insert("end", name)
+# --- Serveur HTTP local --------------------------------------------------------
+STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
+          "/style.css": ("style.css", "text/css; charset=utf-8"),
+          "/app.js": ("app.js", "text/javascript; charset=utf-8")}
 
-        def add(_):
-            sel = lb.curselection()
-            if sel:
-                name = lb.get(sel[0])
-                current = self.txt_apps.get("1.0", "end").split()
-                if name not in current:
-                    self.txt_apps.insert("end", ("\n" if current else "") + name)
-                lb.delete(sel[0])
 
-        lb.bind("<Double-Button-1>", add)
+def make_handler(engine: Engine, token: str, port_ref: list):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
 
-    # ----- Rituel
-    def _ritual_check(self):
-        if all(v.get() for v in self.ritual_vars):
-            self.btn_shutdown.state(["!disabled"])
-        else:
-            self.btn_shutdown.state(["disabled"])
+        def _send(self, code: int, body: bytes, ctype: str):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
-    def shutdown_complete(self):
-        self.config["last_shutdown"] = dt.date.today().isoformat()
-        save_json(CONFIG_FILE, self.config)
-        for v in self.ritual_vars:
-            v.set(False)
-        self.btn_shutdown.state(["disabled"])
-        self.lbl_ritual.configure(text="Shutdown complete.\nTa journée de travail est terminée : déconnecte-toi vraiment. "
-                                       "Le repos fait partie du travail profond.")
+        def _json(self, code: int, data):
+            self._send(code, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json")
 
-    # ----- Score
-    def save_goal(self):
-        try:
-            self.config["weekly_goal_hours"] = max(1, int(self.goal.get()))
-        except (tk.TclError, ValueError):
-            return
-        save_json(CONFIG_FILE, self.config)
-        self.refresh_score()
+        def _host_ok(self) -> bool:
+            # Protège contre le DNS rebinding : seule l'adresse locale exacte est acceptée.
+            return self.headers.get("Host") in (f"127.0.0.1:{port_ref[0]}", f"localhost:{port_ref[0]}")
 
-    def refresh_score(self):
-        if not hasattr(self, "canvas"):
-            return
-        today = dt.date.today()
-        monday = today - dt.timedelta(days=today.weekday())
-        per_day = [0.0] * 7
-        days_with_work = set()
-        for s in self.sessions:
-            d = dt.datetime.fromisoformat(s["start"]).date()
-            days_with_work.add(d)
-            if monday <= d <= today:
-                per_day[(d - monday).days] += s["actual_min"]
+        def _api_ok(self) -> bool:
+            return self._host_ok() and secrets.compare_digest(self.headers.get("X-Token", ""), token)
 
-        streak, d = 0, today
-        if d not in days_with_work:
-            d -= dt.timedelta(days=1)
-        while d in days_with_work:
-            streak += 1
-            d -= dt.timedelta(days=1)
+        def do_GET(self):
+            path = self.path.split("?", 1)[0]
+            if path in STATIC and self._host_ok():
+                name, ctype = STATIC[path]
+                body = (UI_DIR / name).read_bytes()
+                if name == "index.html":
+                    body = body.replace(b"__TOKEN__", token.encode())
+                return self._send(200, body, ctype)
+            if not self._api_ok():
+                return self._json(403, {"error": "Accès refusé."})
+            if path == "/api/ping":
+                return self._json(200, {"ok": True})
+            if path == "/api/state":
+                return self._json(200, engine.snapshot())
+            if path == "/api/apps":
+                return self._json(200, {"apps": scan_installed_apps(refresh="refresh=1" in self.path)})
+            self._json(404, {"error": "Introuvable."})
 
-        week_h = sum(per_day) / 60
-        goal = self.config["weekly_goal_hours"]
-        self.lbl_week.configure(text=f"Cette semaine : {week_h:.1f} h sur {goal} h  ({min(100, 100 * week_h / goal):.0f} %)"
-                                     f"    ·    Série : {streak} jour{'s' if streak > 1 else ''}"
-                                     f"    ·    Total : {len(self.sessions)} sessions")
+        def do_POST(self):
+            if not self._api_ok():
+                return self._json(403, {"error": "Accès refusé."})
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                data = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                data = {}
+            actions = {"/api/start": engine.start, "/api/stop": engine.stop, "/api/review": engine.review,
+                       "/api/config": engine.update_config}
+            try:
+                if self.path == "/api/elevate":
+                    result = engine.elevate()
+                elif self.path == "/api/quit":
+                    self._json(200, {})
+                    threading.Thread(target=self.server.shutdown, daemon=True).start()
+                    return
+                elif self.path in actions:
+                    result = actions[self.path](data)
+                else:
+                    return self._json(404, {"error": "Introuvable."})
+            except ApiError as e:
+                return self._json(400, {"error": str(e)})
+            except (OSError, ValueError, TypeError) as e:
+                return self._json(500, {"error": f"Erreur : {e}"})
+            self._json(200, result or {})
 
-        c = self.canvas
-        c.delete("all")
-        w, h = max(c.winfo_width(), 400), 220
-        pad_l, pad_b, pad_t = 40, 30, 20
-        daily_goal = goal * 60 / 5  # objectif journalier indicatif sur 5 jours ouvrés
-        top = max(max(per_day), daily_goal, 60)
-        slot = (w - pad_l - 20) / 7
-        y_goal = h - pad_b - (h - pad_b - pad_t) * daily_goal / top
-        c.create_line(pad_l, y_goal, w - 20, y_goal, fill=ACCENT_DIM, dash=(4, 4))
-        c.create_text(pad_l - 6, y_goal, text=f"{daily_goal / 60:.0f}h", fill=MUTED, anchor="e", font=("Segoe UI", 8))
-        for i, label in enumerate(["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]):
-            x0 = pad_l + i * slot + slot * 0.25
-            x1 = x0 + slot * 0.5
-            bh = (h - pad_b - pad_t) * per_day[i] / top
-            colour = ACCENT if per_day[i] >= daily_goal else "#a07a42"
-            if per_day[i] > 0:
-                c.create_rectangle(x0, h - pad_b - bh, x1, h - pad_b, fill=colour, width=0)
-                c.create_text((x0 + x1) / 2, h - pad_b - bh - 9, text=f"{per_day[i] / 60:.1f}h", fill=TEXT, font=("Segoe UI", 8))
-            is_today = monday + dt.timedelta(days=i) == today
-            c.create_text((x0 + x1) / 2, h - pad_b + 14, text=label, fill=ACCENT if is_today else MUTED,
-                          font=("Segoe UI Semibold" if is_today else "Segoe UI", 9))
+    return Handler
 
-        t = self.txt_history
-        t.configure(state="normal")
-        t.delete("1.0", "end")
-        if not self.sessions:
-            t.insert("1.0", "Aucune session pour l'instant. Lance ta première session dans l'onglet Session.")
-        for s in reversed(self.sessions[-30:]):
-            mark = "✓" if s["completed"] else "✗"
-            t.insert("end", f"{mark} {s['start'].replace('T', ' ')}  {s['actual_min']:>5.0f} min  "
-                            f"profondeur {s['depth']}/5  {s['intention']}\n")
-            if s.get("note"):
-                t.insert("end", f"    ↳ {s['note']}\n")
-        t.configure(state="disabled")
+
+def ping(port: int, token: str) -> bool:
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/ping", headers={"X-Token": token})
+    try:
+        with urllib.request.urlopen(req, timeout=1.5) as r:
+            return r.status == 200
+    except OSError:
+        return False
 
 
 def main():
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    replace = "--replace" in sys.argv
+    previous = load_json(SERVER_FILE, {})
+
+    if previous and ping(previous["port"], previous["token"]):
+        if not replace:
+            open_window(f"http://127.0.0.1:{previous['port']}/")
+            return
+        # Relance en administrateur : on prend la place de l'instance existante sur le même port,
+        # pour que la fenêtre déjà ouverte se reconnecte toute seule.
+        req = urllib.request.Request(f"http://127.0.0.1:{previous['port']}/api/quit", data=b"{}", method="POST",
+                                     headers={"X-Token": previous["token"], "Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=2).close()
+        except OSError:
+            pass
+        time.sleep(1.0)
+
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DeepWorkFocus")
     except (AttributeError, OSError):
         pass
-    root = tk.Tk()
-    DeepWorkApp(root)
-    root.mainloop()
+
+    engine = Engine()
+    port_ref = [0]
+    token = previous.get("token") if replace and previous else secrets.token_urlsafe(24)
+    server = None
+    if replace and previous:
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", previous["port"]), make_handler(engine, token, port_ref))
+        except OSError:
+            server = None
+    reopen = server is None
+    if server is None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, token, port_ref))
+    port_ref[0] = server.server_address[1]
+    engine.url = f"http://127.0.0.1:{port_ref[0]}/"
+    save_json(SERVER_FILE, {"port": port_ref[0], "token": token, "pid": os.getpid()})
+
+    engine.on_idle = lambda: threading.Thread(target=server.shutdown, daemon=True).start()
+    threading.Thread(target=engine.run_forever, daemon=True).start()
+    if reopen:
+        open_window(engine.url)
+    try:
+        server.serve_forever(poll_interval=0.5)
+    finally:
+        server.server_close()
+        with engine.lock:
+            current = load_json(SERVER_FILE, {})
+            if current.get("pid") == os.getpid():
+                SERVER_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
