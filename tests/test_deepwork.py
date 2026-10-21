@@ -416,7 +416,6 @@ class TestHttp(Sandbox):
             (b"[1, 2, 3]", None),
             (b'"texte"', None),
             (b"null", None),
-            (b"{}", {"Content-Length": "abc"}),
             (json.dumps({"intention": "x", "minutes": "abc"}).encode(), None),
             (json.dumps({"intention": {"a": 1}, "minutes": 25}).encode(), None),
         ]
@@ -429,15 +428,10 @@ class TestHttp(Sandbox):
         self.assertEqual(self.req("GET", "/api/ping")[0].status, 200)  # le serveur répond toujours
 
     def test_bad_lengths_refused(self):
-        # Le serveur refuse sans lire le corps annoncé ; Windows peut alors couper la connexion
-        # avant que le client lise la réponse, ce qui reste un refus.
-        for length, code in [(str(50 * 1024 * 1024), 413), ("-5", 400)]:
+        for length, code in [(str(50 * 1024 * 1024), 413), ("-5", 400), ("abc", 400)]:
             with self.subTest(length=length):
-                try:
-                    r, _ = self.req("POST", "/api/config", b"{}", headers={"Content-Length": length})
-                    self.assertEqual(r.status, code)
-                except ConnectionError:
-                    pass
+                r, _ = self.req("POST", "/api/config", b"{}", headers={"Content-Length": length})
+                self.assertEqual(r.status, code)
         self.assertEqual(self.req("GET", "/api/ping")[0].status, 200)
 
     def test_unknown_routes(self):

@@ -650,6 +650,17 @@ def make_handler(engine: Engine, token: str, port_ref: list):
         def _json(self, code: int, data):
             self._send(code, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json")
 
+        def _drain(self):
+            # Lit (sans le garder) ce que le client a déjà envoyé, dans une limite de taille et de temps :
+            # sinon Windows coupe la connexion avant que la réponse d'erreur n'arrive.
+            self.connection.settimeout(0.2)
+            try:
+                for _ in range(16):
+                    if not self.rfile.read1(65536):
+                        break
+            except OSError:
+                pass
+
         def _host_ok(self) -> bool:
             # Protège contre le DNS rebinding : seule l'adresse locale exacte est acceptée.
             return self.headers.get("Host") in (f"127.0.0.1:{port_ref[0]}", f"localhost:{port_ref[0]}")
@@ -681,6 +692,7 @@ def make_handler(engine: Engine, token: str, port_ref: list):
             except ValueError:
                 length = -1
             if not 0 <= length <= MAX_BODY:
+                self._drain()
                 self.close_connection = True
                 return self._json(413 if length > MAX_BODY else 400, {"error": "Requête invalide."})
             raw = self.rfile.read(length)
