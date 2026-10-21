@@ -1,0 +1,4 @@
+.remember/
+__pycache__/
+*.pyc
+.claude-flow/
