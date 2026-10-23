@@ -89,6 +89,15 @@ const now = () => Date.now() + clockOffset;
 const fmtClock = (ts) => new Date(ts).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
 const fmtHours = (min) => { const h = min / 60; return h >= 10 ? h.toFixed(0) : h.toFixed(1).replace(".", ","); };
 const plural = (n, one, many) => `${n} ${n > 1 ? many : one}`;
+// 25 → « 25 min », 90 → « 1 h 30 », 120 → « 2 h ».
+const fmtDuration = (min) => {
+  const h = Math.floor(min / 60), m = min % 60;
+  return h ? `${h} h${m ? ` ${String(m).padStart(2, "0")}` : ""}` : `${min} min`;
+};
+const durationChip = (min) => {
+  const h = Math.floor(min / 60), m = min % 60;
+  return h ? `${h}<small> h${m ? " " : ""}</small>${m ? String(m).padStart(2, "0") : ""}` : `${min}<small> min</small>`;
+};
 
 async function api(path, body) {
   const res = await fetch(path, {
@@ -223,7 +232,7 @@ function viewSession() {
       <section class="card">
         <span class="field-label" id="dur-label">Durée</span>
         <div class="segmented" role="group" aria-labelledby="dur-label">
-          ${DURATIONS.map((m) => `<button data-min="${m}" aria-pressed="${!custom && m === minutes}">${m}<small> min</small></button>`).join("")}
+          ${DURATIONS.map((m) => `<button data-min="${m}" aria-pressed="${!custom && m === minutes}" aria-label="${fmtDuration(m)}">${durationChip(m)}</button>`).join("")}
           <button data-custom aria-pressed="${custom}">Autre</button>
           ${custom ? `<span class="custom-min"><input id="custom-min" class="input" type="number" min="5" max="480" step="5" value="${minutes}" aria-label="Durée en minutes"> min</span>` : ""}
         </div>
@@ -238,7 +247,7 @@ function viewSession() {
       </section>
     </div>
     <div class="cta-row">
-      <button class="btn primary large" id="start">${icon("timer")}<span id="start-label">Commencer · ${minutes} min</span></button>
+      <button class="btn primary large" id="start">${icon("timer")}<span id="start-label">Commencer · ${fmtDuration(minutes)}</span></button>
       <span class="helper">ou appuie sur <span class="kbd">Entrée</span></span>
     </div>`;
 }
@@ -248,8 +257,11 @@ function bindSession() {
   const minutes = () => draft.minutes ?? S.config.default_minutes ?? 90;
   const refreshEnd = () => {
     const m = minutes();
-    $("#end-hint").textContent = m >= 5 && m <= 480 ? `Fin prévue à ${fmtClock(now() + m * 60000)}` : "Entre 5 et 480 minutes.";
-    $("#start-label").textContent = `Commencer · ${m} min`;
+    const ok = m >= 5 && m <= 480;
+    $("#end-hint").textContent = ok
+      ? `${m >= 60 ? `${fmtDuration(m)} · ` : ""}Fin prévue à ${fmtClock(now() + m * 60000)}`
+      : "Entre 5 minutes et 8 heures.";
+    $("#start-label").textContent = `Commencer · ${ok ? fmtDuration(m) : `${m} min`}`;
   };
   refreshEnd();
   const input = $("#intention");
@@ -415,7 +427,7 @@ function openReview(s) {
   let depth = null;
   const d = showDialog(`
     <h2 id="dialog-title">${s.completed ? "Session terminée. Bien joué." : "Session interrompue"}</h2>
-    <p class="lead">${Math.round(s.actual_min)} min sur « ${esc(s.intention)} »${s.blocked ? ` · ${plural(s.blocked, "distraction bloquée", "distractions bloquées")}` : ""}</p>
+    <p class="lead">${fmtDuration(Math.round(s.actual_min))} sur «${esc(s.intention)} »${s.blocked ? ` · ${plural(s.blocked, "distraction bloquée", "distractions bloquées")}` : ""}</p>
     <span class="field-label" id="depth-label">À quel point étais-tu concentré ?</span>
     <div class="depth-pick" role="group" aria-labelledby="depth-label">
       ${DEPTH_LABELS.map((l, i) => `<button data-depth="${i + 1}" aria-pressed="false">${i + 1}<small>${l}</small></button>`).join("")}
@@ -790,7 +802,7 @@ function historyRow(s) {
     <div><div class="h-title">${esc(s.intention)}</div>
       <div class="h-sub">${date} à ${fmtClock(d)} · profondeur ${depth}</div>
       ${s.note ? `<div class="h-note">${esc(s.note)}</div>` : ""}</div>
-    <div class="h-right">${Math.round(s.actual_min)} min</div></div>`;
+    <div class="h-right">${fmtDuration(Math.round(s.actual_min))}</div></div>`;
 }
 
 function bindProgress() {
