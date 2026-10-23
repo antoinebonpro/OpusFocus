@@ -1,5 +1,5 @@
 "use strict";
-/* Deep Work Focus — interface. Le moteur Python fait foi : on l'interroge chaque seconde. */
+/* OpusFocus — interface. Le moteur Python fait foi : on l'interroge chaque seconde. */
 
 const TOKEN = document.querySelector('meta[name="token"]').content;
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -366,13 +366,13 @@ function updateLive() {
 
 setInterval(() => {
   if (!S?.session) {
-    if (document.title !== "Deep Work Focus") document.title = "Deep Work Focus";
+    if (document.title !== "OpusFocus") document.title = "OpusFocus";
     return;
   }
   if (page === "session") updateLive();
   const side = $("#side-time");
   if (side) side.textContent = fmtRemaining(Math.max(0, S.session.end * 1000 - now()));
-  document.title = `${fmtRemaining(Math.max(0, S.session.end * 1000 - now()))} · Deep Work Focus`;
+  document.title = `${fmtRemaining(Math.max(0, S.session.end * 1000 - now()))} · OpusFocus`;
 }, 250);
 
 // --- Fenêtres modales ---------------------------------------------------------------

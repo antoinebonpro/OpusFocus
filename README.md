@@ -1,8 +1,9 @@
-# Deep Work Focus
+# OpusFocus
 
 Bloqueur de distractions pour Windows, inspiré de *Deep Work* (Cal Newport).
 
 ## Lancer
+- **`OpusFocus.exe`** (construit avec `build.ps1`, dans `dist\`) : l'application complète en un seul fichier, sans Python à installer. Place un dossier `Music` à côté pour la musique focus.
 - **`Lancer Deep Work.bat`** : ouvre l'application. Elle coupe les notifications et ferme les applications cochées.
 - **`Lancer Deep Work (admin - bloque aussi les sites).bat`** : même chose, avec en plus le blocage des sites web (Windows demande une confirmation). Tu peux aussi activer ce mode plus tard, depuis l'application, avec le bouton « Activer ».
 
@@ -27,10 +28,10 @@ Les cases cochées sont enregistrées automatiquement. Tu peux fermer la fenêtr
 
 Architecture : `deepwork.py` est le moteur. Il sert l'interface (`ui/`) sur `127.0.0.1`, protégée par un jeton, et l'affiche dans une fenêtre de navigateur en mode application. `scan_apps.ps1` liste les applications du menu Démarrer et du Microsoft Store.
 
-Si l'application plante, la session reprend au prochain lancement ; si elle est déjà terminée, tout est restauré. Un navigateur peut être bloqué sans risque : les processus qui affichent Deep Work Focus sont reconnus et épargnés.
+Si l'application plante, la session reprend au prochain lancement ; si elle est déjà terminée, tout est restauré. Un navigateur peut être bloqué sans risque : les processus qui affichent OpusFocus sont reconnus et épargnés.
 
 ## Données
-Elles sont stockées dans `%APPDATA%\DeepWorkFocus\` : `config.json` (listes et réglages), `sessions.json` (historique), `apps.json` (cache des applications) et `state.json` (session en cours).
+Elles sont stockées dans `%APPDATA%\DeepWorkFocus\` (nom d'origine, conservé au renommage) : `config.json` (listes et réglages), `sessions.json` (historique), `apps.json` (cache des applications) et `state.json` (session en cours).
 
 ## Sécurité
 - L'interface n'écoute que sur `127.0.0.1`. Chaque appel à l'API exige un jeton aléatoire, et l'en-tête `Host` est vérifié contre le DNS rebinding.
@@ -41,7 +42,7 @@ Elles sont stockées dans `%APPDATA%\DeepWorkFocus\` : `config.json` (listes et 
 ```
 python -m unittest discover -s tests -v
 ```
-48 tests couvrent la logique, la sécurité de l'API (jeton, rebinding, CSP, traversée de chemin, corps malformés), le fichier `hosts`, la reprise après plantage et l'interface (échappement HTML). Ils travaillent dans un dossier temporaire et ne touchent ni tes données ni le vrai fichier `hosts`. Seuls deux tests touchent Windows, de façon contrôlée : l'un ferme un processus factice, l'autre lit la clé des notifications puis la restaure.
+58 tests couvrent la logique, la sécurité de l'API (jeton, rebinding, CSP, traversée de chemin, corps malformés), le fichier `hosts`, la reprise après plantage et l'interface (échappement HTML). Ils travaillent dans un dossier temporaire et ne touchent ni tes données ni le vrai fichier `hosts`. Seuls deux tests touchent Windows, de façon contrôlée : l'un ferme un processus factice, l'autre lit la clé des notifications puis la restaure.
 
 ## Limites
 - Les applications sont fermées de force : ce qui n'y est pas enregistré est perdu.

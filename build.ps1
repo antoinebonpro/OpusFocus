@@ -1,4 +1,4 @@
-# Construit dist\DeepWorkFocus.exe (un seul fichier, sans console).
+# Construit dist\OpusFocus.exe (un seul fichier, sans console).
 # Usage : powershell -ExecutionPolicy Bypass -File build.ps1
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -12,7 +12,7 @@ $py = "$venv\Scripts\python.exe"
 & $py build\make_icon.py
 
 & $py -m PyInstaller --noconfirm --clean --onefile --windowed `
-    --name DeepWorkFocus `
+    --name OpusFocus `
     --icon "$PSScriptRoot\build\icon.ico" `
     --add-data "$PSScriptRoot\ui;ui" `
     --add-data "$PSScriptRoot\scan_apps.ps1;." `
@@ -20,4 +20,4 @@ $py = "$venv\Scripts\python.exe"
     deepwork.py
 if ($LASTEXITCODE -ne 0) { throw "Échec de PyInstaller" }
 
-Write-Host "`nOK : $PSScriptRoot\dist\DeepWorkFocus.exe"
+Write-Host "`nOK : $PSScriptRoot\dist\OpusFocus.exe"

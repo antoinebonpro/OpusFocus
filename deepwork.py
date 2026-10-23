@@ -1,5 +1,5 @@
 """
-Deep Work Focus — bloqueur de distractions inspiré de « Deep Work » (Cal Newport).
+OpusFocus — bloqueur de distractions inspiré de « Deep Work » (Cal Newport).
 
 Le moteur (ce fichier) applique les blocages et sert l'interface (dossier ui/) sur
 127.0.0.1. L'interface s'ouvre dans une fenêtre Edge en mode application.
@@ -32,7 +32,7 @@ import winsound
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_NAME = "Deep Work Focus"
+APP_NAME = "OpusFocus"
 FROZEN = getattr(sys, "frozen", False)  # empaqueté en .exe par PyInstaller
 # En .exe, les fichiers embarqués (ui/, scan_apps.ps1) sont extraits dans sys._MEIPASS.
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
@@ -40,6 +40,7 @@ UI_DIR = ROOT / "ui"
 # Dossier à côté du .exe (ou du script) : c'est là que l'utilisateur dépose sa musique.
 APP_HOME = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
 MUSIC_DIR = APP_HOME / "Music"
+# Nom interne d'origine conservé (dossier de données, verrou, marqueurs hosts) : rien n'est perdu au renommage.
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "DeepWorkFocus"
 CONFIG_FILE = APP_DIR / "config.json"
 SESSIONS_FILE = APP_DIR / "sessions.json"
@@ -65,7 +66,7 @@ NOTIF_KEYS = [
 ]
 
 # Processus qu'on ne tue jamais.
-PROTECTED = {"explorer.exe", "python.exe", "pythonw.exe", "deepworkfocus.exe", "svchost.exe", "csrss.exe", "winlogon.exe",
+PROTECTED = {"explorer.exe", "python.exe", "pythonw.exe", "opusfocus.exe", "deepworkfocus.exe", "svchost.exe", "csrss.exe", "winlogon.exe",
              "dwm.exe", "taskmgr.exe", "system", "lsass.exe", "msedgewebview2.exe",
              "conhost.exe", "powershell.exe", "searchhost.exe", "startmenuexperiencehost.exe"}
 # Navigateurs pouvant afficher la fenêtre de l'application (par ordre de préférence).
@@ -388,7 +389,7 @@ def kill_blocked(apps: list[str]) -> list[str]:
     for pid, name in list_processes():
         if name not in targets:
             continue
-        # Le navigateur qui affiche Deep Work Focus est épargné : on reconnaît son profil dédié.
+        # Le navigateur qui affiche OpusFocus est épargné : on reconnaît son profil dédié.
         if name in WINDOW_BROWSERS and marker in process_command_line(pid).lower():
             continue
         handle = _kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
@@ -962,7 +963,7 @@ def main():
         time.sleep(0.3)  # laisse au système le temps de libérer le port
 
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DeepWorkFocus")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OpusFocus")
     except (AttributeError, OSError):
         pass
 
