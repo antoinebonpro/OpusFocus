@@ -448,6 +448,117 @@ class TestHttp(Sandbox):
     def test_listens_on_loopback_only(self):
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
 
+    def _music_dir(self):
+        folder = TMP / "music"
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir()
+        (folder / "Piste _ Focus.m4a").write_bytes(bytes(range(256)) * 4)  # 1024 octets
+        (folder / "notes.txt").write_text("pas de l'audio", encoding="utf-8")
+        (TMP / "secret.m4a").write_bytes(b"hors du dossier")
+        p = mock.patch.object(dw, "MUSIC_DIR", folder)
+        p.start()
+        self.addCleanup(p.stop)
+        return folder
+
+    def test_music_list_and_stream(self):
+        self._music_dir()
+        r, body = self.req("GET", "/api/music")
+        self.assertEqual(r.status, 200)
+        self.assertEqual(json.loads(body)["tracks"], [{"file": "Piste _ Focus.m4a", "title": "Piste · Focus"}])
+        url = "/music/Piste%20_%20Focus.m4a?t=" + self.TOKEN
+        r, body = self.req("GET", url, token=False)
+        self.assertEqual((r.status, len(body), r.getheader("Content-Type")), (200, 1024, "audio/mp4"))
+        self.assertEqual(r.getheader("Accept-Ranges"), "bytes")
+        r, body = self.req("GET", url, token=False, headers={"Range": "bytes=1000-"})
+        self.assertEqual((r.status, body, r.getheader("Content-Range")), (206, bytes(range(232, 256)), "bytes 1000-1023/1024"))
+        r, body = self.req("GET", url, token=False, headers={"Range": "bytes=-4"})
+        self.assertEqual((r.status, body), (206, bytes([252, 253, 254, 255])))
+        r, _ = self.req("GET", url, token=False, headers={"Range": "bytes=5000-"})
+        self.assertEqual((r.status, r.getheader("Content-Range")), (416, "bytes */1024"))
+
+    def test_music_requires_token_and_stays_in_folder(self):
+        self._music_dir()
+        for path in ("/music/Piste%20_%20Focus.m4a", "/music/Piste%20_%20Focus.m4a?t=faux"):
+            self.assertEqual(self.req("GET", path, token=False)[0].status, 403, path)
+        self.assertEqual(self.req("GET", "/music/x.m4a?t=" + self.TOKEN, token=False,
+                                  host="evil.com")[0].status, 403)
+        for name in ("..%2Fsecret.m4a", "../secret.m4a", "notes.txt", "%2E%2E%5Csecret.m4a", "inconnu.m4a"):
+            with self.subTest(name=name):
+                self.assertEqual(self.req("GET", f"/music/{name}?t={self.TOKEN}", token=False)[0].status, 404)
+
+    def test_music_autoplay_setting(self):
+        self.assertFalse(self.engine.config["music_autoplay"])
+        r, body = self.req("POST", "/api/config", {"music_autoplay": True})
+        self.assertTrue(json.loads(body)["config"]["music_autoplay"])
+        self.assertTrue(dw.load_config()["music_autoplay"])
+
+    def test_csp_allows_local_media_only(self):
+        r, _ = self.req("GET", "/", token=False)
+        self.assertIn("media-src 'self'", r.getheader("Content-Security-Policy"))
+
+
+class TestMusicHelpers(unittest.TestCase):
+    def test_parse_range(self):
+        cases = {"bytes=0-": (0, 99), "bytes=10-19": (10, 19), "bytes=90-500": (90, 99), "bytes=-10": (90, 99),
+                 "bytes=-500": (0, 99), "bytes=100-": None, "bytes=20-10": None, "bytes=-": None,
+                 "octets=0-1": None, "bytes=0-1,5-6": None, "bytes=abc": None}
+        for header, expected in cases.items():
+            with self.subTest(header=header):
+                self.assertEqual(dw.parse_range(header, 100), expected)
+        self.assertIsNone(dw.parse_range("bytes=0-", 0))
+
+    def test_track_title(self):
+        self.assertEqual(dw.track_title("- Hyperfocus _ LOCK IN for 3 Hours _ Deep Work"),
+                         "Hyperfocus · LOCK IN for 3 Hours · Deep Work")
+        self.assertEqual(dw.track_title("simple"), "simple")
+
+    def test_missing_folder(self):
+        self.assertEqual(dw.list_music(TMP / "absent"), [])
+        self.assertIsNone(dw.music_file("x.mp3", TMP / "absent"))
+
+
+class TestSingleInstance(unittest.TestCase):
+    def test_second_acquire_fails_until_release(self):
+        with mock.patch.object(dw, "MUTEX_NAME", f"Local\\DeepWorkFocusTest{os.getpid()}"):
+            first = dw.acquire_single_instance()
+            self.assertTrue(first)
+            try:
+                started = time.time()
+                self.assertIsNone(dw.acquire_single_instance(timeout=0.5))
+                self.assertGreaterEqual(time.time() - started, 0.4)
+            finally:
+                dw._kernel32.CloseHandle(first)
+            second = dw.acquire_single_instance()
+            self.assertTrue(second)
+            dw._kernel32.CloseHandle(second)
+
+    def test_show_window_never_opens_duplicates(self):
+        engine = dw.Engine.__new__(dw.Engine)
+        engine.lock, engine.url, engine.window_opened_at = dw.threading.RLock(), "http://127.0.0.1:1/", 0.0
+        opened = []
+        with mock.patch.object(dw, "open_window", opened.append), mock.patch.object(dw, "focus_window", lambda: False):
+            threads = [threading.Thread(target=engine.show_window) for _ in range(5)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(opened, ["http://127.0.0.1:1/"])  # cinq demandes simultanées → une fenêtre
+            engine.window_opened_at -= 20
+            engine.show_window()
+            self.assertEqual(len(opened), 2)  # fenêtre fermée depuis : on en rouvre une
+        with mock.patch.object(dw, "open_window", opened.append), mock.patch.object(dw, "focus_window", lambda: True):
+            engine.show_window()
+            self.assertEqual(len(opened), 2)  # fenêtre existante : ramenée au premier plan, pas rouverte
+        with mock.patch.object(dw, "open_window", opened.append), mock.patch.object(dw, "focus_window", lambda: False):
+            engine.show_window()
+            self.assertEqual(len(opened), 3)  # fermée juste après être apparue : relancer la rouvre aussitôt
+
+    def test_focus_window_ignores_other_windows(self):
+        # Aucune fenêtre de l'application n'est ouverte pendant les tests : rien ne doit être activé.
+        with mock.patch.object(dw._user32, "SetForegroundWindow", side_effect=AssertionError("activée à tort")):
+            with mock.patch.object(dw, "WINDOW_PROFILE", TMP / "profil-inexistant"):
+                self.assertFalse(dw.focus_window())
+
 
 # --- Interface (contrôles statiques) ---------------------------------------------------------
 class TestFrontend(unittest.TestCase):
@@ -462,7 +573,7 @@ class TestFrontend(unittest.TestCase):
 
     def test_user_fields_are_escaped(self):
         # Toute donnée venant de l'utilisateur ou du système passe par esc() avant d'aller dans le HTML.
-        for field in ("intention", "note", "name", "exe", "icon"):
+        for field in ("intention", "note", "name", "exe", "icon", "title", "folder"):
             for m in re.finditer(r"\$\{([^}]*\." + field + r")\}", self.JS):
                 self.fail(f"interpolation non échappée : ${{{m.group(1)}}}")
 

@@ -23,6 +23,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import webbrowser
 import winreg
@@ -31,8 +33,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 APP_NAME = "Deep Work Focus"
-ROOT = Path(__file__).resolve().parent
+FROZEN = getattr(sys, "frozen", False)  # empaqueté en .exe par PyInstaller
+# En .exe, les fichiers embarqués (ui/, scan_apps.ps1) sont extraits dans sys._MEIPASS.
+ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 UI_DIR = ROOT / "ui"
+# Dossier à côté du .exe (ou du script) : c'est là que l'utilisateur dépose sa musique.
+APP_HOME = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
+MUSIC_DIR = APP_HOME / "Music"
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "DeepWorkFocus"
 CONFIG_FILE = APP_DIR / "config.json"
 SESSIONS_FILE = APP_DIR / "sessions.json"
@@ -47,6 +54,10 @@ HOSTS_END = "# <<< DeepWorkFocus"
 CREATE_NO_WINDOW = 0x08000000
 ABANDON_PHRASE = "j'abandonne ma session de deep work"
 IDLE_EXIT_SECONDS = 25
+MUTEX_NAME = "Local\\DeepWorkFocus"
+AUDIO_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".aac": "audio/aac",
+               ".ogg": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav", ".flac": "audio/flac",
+               ".webm": "audio/webm"}
 
 NOTIF_KEYS = [
     (r"Software\Microsoft\Windows\CurrentVersion\PushNotifications", "ToastEnabled"),
@@ -54,7 +65,7 @@ NOTIF_KEYS = [
 ]
 
 # Processus qu'on ne tue jamais.
-PROTECTED = {"explorer.exe", "python.exe", "pythonw.exe", "svchost.exe", "csrss.exe", "winlogon.exe",
+PROTECTED = {"explorer.exe", "python.exe", "pythonw.exe", "deepworkfocus.exe", "svchost.exe", "csrss.exe", "winlogon.exe",
              "dwm.exe", "taskmgr.exe", "system", "lsass.exe", "msedgewebview2.exe",
              "conhost.exe", "powershell.exe", "searchhost.exe", "startmenuexperiencehost.exe"}
 # Navigateurs pouvant afficher la fenêtre de l'application (par ordre de préférence).
@@ -67,6 +78,7 @@ DEFAULT_CONFIG = {
               "youtube.com", "reddit.com", "netflix.com", "twitch.tv", "linkedin.com",
               "snapchat.com", "pinterest.com"],
     "weekly_goal_hours": 15,
+    "music_autoplay": False,
     "default_minutes": 90,
     "shutdown_checklist": [
         "J'ai vérifié mes e-mails et messages une dernière fois",
@@ -141,8 +153,11 @@ def pythonw() -> str:
 
 
 def relaunch_as_admin() -> bool:
-    args = f'"{Path(__file__).resolve()}" --replace'
-    return ctypes.windll.shell32.ShellExecuteW(None, "runas", pythonw(), args, str(ROOT), 1) > 32
+    if FROZEN:
+        exe, args = sys.executable, "--replace"
+    else:
+        exe, args = pythonw(), f'"{Path(__file__).resolve()}" --replace'
+    return ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, str(Path(exe).parent), 1) > 32
 
 
 def _read_dword(path: str, name: str):
@@ -300,6 +315,68 @@ def process_command_line(pid: int) -> str:
         _kernel32.CloseHandle(handle)
 
 
+_kernel32.CreateMutexW.restype = ctypes.c_void_p
+_kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+_user32.EnumWindows.argtypes = [_WNDENUMPROC, ctypes.c_void_p]
+for _fn in ("IsWindowVisible", "IsIconic", "SetForegroundWindow", "GetWindowTextLengthW"):
+    getattr(_user32, _fn).argtypes = [ctypes.c_void_p]
+_user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+_user32.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+_user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+_user32.AllowSetForegroundWindow.argtypes = [ctypes.c_ulong]
+
+
+def acquire_single_instance(timeout: float = 0.0):
+    """Verrou système détenu tant que le processus vit ; None si une autre instance le tient déjà."""
+    end = time.time() + timeout
+    while True:
+        handle = _kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        # ERROR_ALREADY_EXISTS (183) ; une instance administrateur donne ERROR_ACCESS_DENIED et un handle nul.
+        if handle and ctypes.get_last_error() != 183:
+            return handle
+        if handle:
+            _kernel32.CloseHandle(handle)
+        if time.time() >= end:
+            return None
+        time.sleep(0.2)
+
+
+def find_app_window():
+    """Fenêtre de l'application (reconnue à son profil de navigateur dédié), ou None."""
+    marker, found, cmdlines = str(WINDOW_PROFILE).lower(), [], {}
+
+    def visit(hwnd, _):
+        n = _user32.GetWindowTextLengthW(hwnd)
+        if n and _user32.IsWindowVisible(hwnd):
+            buf = ctypes.create_unicode_buffer(n + 1)
+            _user32.GetWindowTextW(hwnd, buf, n + 1)
+            if buf.value == APP_NAME or buf.value.endswith(f" · {APP_NAME}"):
+                pid = ctypes.c_ulong()
+                _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if pid.value not in cmdlines:
+                    cmdlines[pid.value] = process_command_line(pid.value).lower()
+                if marker in cmdlines[pid.value]:
+                    found.append(hwnd)
+                    return False
+        return True
+
+    _user32.EnumWindows(_WNDENUMPROC(visit), None)
+    return found[0] if found else None
+
+
+def focus_window() -> bool:
+    """Ramène au premier plan la fenêtre déjà ouverte."""
+    hwnd = find_app_window()
+    if not hwnd:
+        return False
+    if _user32.IsIconic(hwnd):
+        _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    _user32.SetForegroundWindow(hwnd)
+    return True
+
+
 def running_processes() -> set[str]:
     return {name for _, name in list_processes()}
 
@@ -358,6 +435,44 @@ def scan_installed_apps(refresh: bool = False) -> list[dict]:
     return apps
 
 
+# --- Musique focus -------------------------------------------------------------
+def track_title(stem: str) -> str:
+    # Les titres téléchargés remplacent souvent « | » par « _ » : on les rend lisibles.
+    return re.sub(r"\s+_\s+", " · ", stem).strip(" -_") or stem
+
+
+def list_music(folder: Path | None = None) -> list[dict]:
+    folder = folder or MUSIC_DIR
+    try:
+        files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_TYPES]
+    except OSError:
+        return []
+    return [{"file": p.name, "title": track_title(p.stem)} for p in sorted(files, key=lambda p: p.name.casefold())]
+
+
+def music_file(name: str, folder: Path | None = None) -> Path | None:
+    """Seuls les fichiers réellement listés sont servis : aucun chemin arbitraire (../) n'est accepté."""
+    folder = folder or MUSIC_DIR
+    return folder / name if any(t["file"] == name for t in list_music(folder)) else None
+
+
+def parse_range(header: str, size: int) -> tuple[int, int] | None:
+    """En-tête Range « bytes=début-fin » → (début, fin) inclus, ou None s'il est invalide."""
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", header.strip())
+    if not m or not (m[1] or m[2]) or size <= 0:
+        return None
+    if m[1]:
+        start, end = int(m[1]), min(int(m[2]), size - 1) if m[2] else size - 1
+    else:
+        start, end = max(0, size - int(m[2])), size - 1
+    return (start, end) if start <= end and start < size else None
+
+
+def open_music_folder() -> None:
+    MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+    os.startfile(MUSIC_DIR)
+
+
 def find_window_browser() -> Path | None:
     """Un navigateur Chromium capable d'ouvrir une fenêtre en mode application."""
     for exe in WINDOW_BROWSERS:
@@ -385,7 +500,8 @@ def open_window(url: str) -> None:
     if browser:
         subprocess.Popen([str(browser), f"--app={url}", f"--user-data-dir={WINDOW_PROFILE}",
                           "--no-first-run", "--no-default-browser-check", "--window-size=1180,820",
-                          "--disable-features=Translate", "--disable-sync"])
+                          "--disable-features=Translate", "--disable-sync",
+                          "--autoplay-policy=no-user-gesture-required"])
     else:
         webbrowser.open(url)
 
@@ -423,6 +539,7 @@ class Engine:
         self.url = ""
         self.on_idle = None
         self.notice = ""
+        self.window_opened_at = 0.0
         self._recover()
 
     # ----- Cycle de vie
@@ -454,6 +571,9 @@ class Engine:
                     self._finish(completed=True)
                     continue
                 idle = not st and not self.review_id and time.time() - self.last_seen > IDLE_EXIT_SECONDS
+            if idle and find_app_window():
+                # Fenêtre réduite : le navigateur ralentit ses appels, mais elle est toujours là.
+                self.last_seen, idle = time.time(), False
             if idle and self.on_idle:
                 self.on_idle()
                 return
@@ -517,8 +637,19 @@ class Engine:
         self._log_session(st, completed)
         self.review_id = st["id"]
         winsound.MessageBeep(winsound.MB_ICONASTERISK)
-        if time.time() - self.last_seen > 4 and self.url:
-            open_window(self.url)
+        if self.url:
+            self.show_window()  # le bilan doit être visible : on montre la fenêtre, ou on la rouvre
+
+    def show_window(self):
+        """Seul le serveur ouvre la fenêtre : aucun doublon, même si l'app est lancée plusieurs fois d'affilée."""
+        with self.lock:
+            if focus_window():
+                self.window_opened_at = 0.0  # la fenêtre est apparue : plus rien n'est en attente
+                return
+            if time.time() - self.window_opened_at < 10:
+                return  # une fenêtre est déjà en train de s'ouvrir
+            self.window_opened_at = time.time()
+        open_window(self.url)
 
     # ----- Actions de l'interface
     def snapshot(self) -> dict:
@@ -601,6 +732,8 @@ class Engine:
                 cfg["sites"] = sites
                 if st and st["sites"]:
                     block_sites(sites)
+            if "music_autoplay" in data:
+                cfg["music_autoplay"] = bool(data["music_autoplay"])
             if "weekly_goal_hours" in data:
                 cfg["weekly_goal_hours"] = max(1, min(80, _int(data["weekly_goal_hours"], "Objectif invalide.")))
             if "shutdown_checklist" in data:
@@ -628,6 +761,7 @@ STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
 
 # La page n'exécute que ses propres scripts et ne peut pas être intégrée dans une iframe (clickjacking).
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "media-src 'self'; "
        "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
 
@@ -668,8 +802,50 @@ def make_handler(engine: Engine, token: str, port_ref: list):
         def _api_ok(self) -> bool:
             return self._host_ok() and secrets.compare_digest(self.headers.get("X-Token", ""), token)
 
+        def _music(self, name: str, query: str):
+            # L'élément <audio> ne peut pas envoyer d'en-tête : le jeton passe dans l'URL.
+            given = urllib.parse.parse_qs(query).get("t", [""])[0]
+            if not (self._host_ok() and secrets.compare_digest(given.encode(), token.encode())):
+                return self._json(403, {"error": "Accès refusé."})
+            file = music_file(name)
+            if not file:
+                return self._json(404, {"error": "Introuvable."})
+            size = file.stat().st_size
+            start, end, code = 0, size - 1, 200
+            if self.headers.get("Range"):
+                rng = parse_range(self.headers["Range"], size)
+                if rng is None:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                (start, end), code = rng, 206
+            self.send_response(code)
+            self.send_header("Content-Type", AUDIO_TYPES[file.suffix.lower()])
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if code == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            try:
+                with file.open("rb") as f:
+                    f.seek(start)
+                    left = end - start + 1
+                    while left > 0:
+                        chunk = f.read(min(256 * 1024, left))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
+            except OSError:
+                pass  # le lecteur a changé de position ou de piste : il coupe la connexion
+
         def do_GET(self):
-            path = self.path.split("?", 1)[0]
+            path, _, query = self.path.partition("?")
+            if path.startswith("/music/"):
+                return self._music(urllib.parse.unquote(path[len("/music/"):]), query)
             if path in STATIC and self._host_ok():
                 name, ctype = STATIC[path]
                 body = (UI_DIR / name).read_bytes()
@@ -684,6 +860,8 @@ def make_handler(engine: Engine, token: str, port_ref: list):
                 return self._json(200, engine.snapshot())
             if path == "/api/apps":
                 return self._json(200, {"apps": scan_installed_apps(refresh="refresh=1" in self.path)})
+            if path == "/api/music":
+                return self._json(200, {"tracks": list_music(), "folder": str(MUSIC_DIR)})
             self._json(404, {"error": "Introuvable."})
 
         def do_POST(self):
@@ -709,6 +887,10 @@ def make_handler(engine: Engine, token: str, port_ref: list):
             try:
                 if self.path == "/api/elevate":
                     result = engine.elevate()
+                elif self.path == "/api/music/open":
+                    result = open_music_folder()
+                elif self.path == "/api/show":
+                    result = engine.show_window()
                 elif self.path == "/api/quit":
                     self._json(200, {})
                     threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -735,15 +917,34 @@ def ping(port: int, token: str) -> bool:
         return False
 
 
+def show_existing_instance(timeout: float = 15.0) -> None:
+    """Demande à l'instance déjà lancée de montrer sa fenêtre (en attendant qu'elle ait fini de démarrer)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        s = load_json(SERVER_FILE, {})
+        if s and ping(s["port"], s["token"]):
+            # Windows ne laisse passer une fenêtre au premier plan que si le processus actif l'y autorise.
+            if s.get("pid"):
+                _user32.AllowSetForegroundWindow(int(s["pid"]))
+            req = urllib.request.Request(f"http://127.0.0.1:{s['port']}/api/show", data=b"{}", method="POST",
+                                         headers={"X-Token": s["token"], "Content-Type": "application/json"})
+            try:
+                urllib.request.urlopen(req, timeout=5).close()
+            except urllib.error.HTTPError:
+                open_window(f"http://127.0.0.1:{s['port']}/")  # ancienne version sans /api/show
+            except OSError:
+                pass
+            return
+        time.sleep(0.3)
+
+
 def main():
     APP_DIR.mkdir(parents=True, exist_ok=True)
     replace = "--replace" in sys.argv
     previous = load_json(SERVER_FILE, {})
+    alive = bool(previous) and ping(previous["port"], previous["token"])
 
-    if previous and ping(previous["port"], previous["token"]):
-        if not replace:
-            open_window(f"http://127.0.0.1:{previous['port']}/")
-            return
+    if replace and alive:
         # Relance en administrateur : on prend la place de l'instance existante sur le même port,
         # pour que la fenêtre déjà ouverte se reconnecte toute seule.
         req = urllib.request.Request(f"http://127.0.0.1:{previous['port']}/api/quit", data=b"{}", method="POST",
@@ -752,7 +953,13 @@ def main():
             urllib.request.urlopen(req, timeout=2).close()
         except OSError:
             pass
-        time.sleep(1.0)
+    mutex = acquire_single_instance(timeout=8 if replace else 0)  # gardé jusqu'à la fin du processus
+    if mutex is None or (alive and not replace):
+        # Une instance tourne déjà : on montre sa fenêtre au lieu d'en lancer une seconde.
+        show_existing_instance()
+        return
+    if replace and alive:
+        time.sleep(0.3)  # laisse au système le temps de libérer le port
 
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("DeepWorkFocus")
@@ -778,7 +985,7 @@ def main():
     engine.on_idle = lambda: threading.Thread(target=server.shutdown, daemon=True).start()
     threading.Thread(target=engine.run_forever, daemon=True).start()
     if reopen:
-        open_window(engine.url)
+        engine.show_window()
     try:
         server.serve_forever(poll_interval=0.5)
     finally:

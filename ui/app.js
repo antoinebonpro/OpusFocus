@@ -29,6 +29,13 @@ const ICONS = {
   sparkle: '<path d="M9.94 14.06 4 20"/><path d="m12 3 1.9 5.8L20 10l-5.4 2.6L12 18l-1.9-5.4L4 10l6.1-1.2z"/>',
   pencil: '<path d="M21.17 6.81a1 1 0 0 0-3.99-3.99L3.84 16.17a2 2 0 0 0-.5.83l-1.32 4.35a.5.5 0 0 0 .62.62l4.35-1.32a2 2 0 0 0 .83-.5z"/>',
   trash: '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
+  music: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  play: '<polygon points="6 3 20 12 6 21 6 3"/>',
+  pause: '<rect x="14" y="4" width="4" height="16" rx="1"/><rect x="6" y="4" width="4" height="16" rx="1"/>',
+  skipBack: '<polygon points="19 20 9 12 19 4 19 20"/><line x1="5" x2="5" y1="19" y2="5"/>',
+  skipForward: '<polygon points="5 4 15 12 5 20 5 4"/><line x1="19" x2="19" y1="5" y2="19"/>',
+  list: '<path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M3 6h.01"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M8 6h13"/>',
+  folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
 };
 const icon = (name, cls = "i") => `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
@@ -115,6 +122,8 @@ async function poll() {
     if (next.notice) toast(next.notice);
     const key = S.session ? `live:${S.session.start}` : "idle";
     const adminChanged = prev && prev.admin !== S.admin;
+    if (prev && !prev.session && S.session) onSessionStart();
+    if (prev?.session && !S.session) onSessionEnd();
     if (!prev || key !== lastSessionKey || adminChanged) {
       lastSessionKey = key;
       if (adminChanged && S.admin) { draft.sites = true; toast("Mode administrateur actif : les sites peuvent être bloqués."); }
@@ -315,7 +324,7 @@ function viewLive() {
       <div class="pills">${pills.map(([i, t]) => `<span class="pill">${icon(i)}${t}</span>`).join("") || '<span class="pill">Aucun blocage actif</span>'}</div>
       <div class="blocked-msg" id="blocked" aria-live="polite"></div>
       <button class="btn ghost" id="stop">${icon("x")}Arrêter la session</button>
-      <p class="hint">Tu peux fermer cette fenêtre : la protection continue, et la fenêtre se rouvrira à la fin.</p>
+      <p class="hint">Tu peux fermer cette fenêtre : la protection continue, et la fenêtre se rouvrira à la fin.${audio.paused ? "" : " La musique, elle, s'arrêtera."}</p>
     </div>`;
 }
 
@@ -884,6 +893,165 @@ function viewRules() {
     </div>`;
 }
 
+// --- Musique focus --------------------------------------------------------------------
+// Volume, piste et position sont propres à cette fenêtre : on les garde dans son stockage local.
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* stockage indisponible */ } },
+};
+const audio = $("#audio");
+const music = { tracks: null, folder: "", idx: 0, auto: false, seeking: false, savedAt: 0 };
+audio.volume = Math.min(1, Math.max(0, +store.get("music.volume", 0.6) || 0));
+
+const fmtTime = (sec) => {
+  if (!Number.isFinite(sec)) return "--:--";
+  const s = Math.floor(sec), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(r).padStart(2, "0")}` : `${m}:${String(r).padStart(2, "0")}`;
+};
+
+async function loadMusic() {
+  try {
+    const r = await api("/api/music");
+    music.tracks = r.tracks;
+    music.folder = r.folder;
+  } catch { music.tracks = music.tracks ?? []; }
+  const current = audio.getAttribute("src") ? music.tracks[music.idx]?.file : store.get("music.track", null);
+  const i = music.tracks.findIndex((t) => t.file === current);
+  music.idx = i >= 0 ? i : 0;
+  if (!audio.getAttribute("src") && music.tracks.length) setTrack(music.idx, false);
+  renderPlayer();
+}
+
+function setTrack(i, play = true) {
+  if (!music.tracks?.length) return;
+  music.idx = (i + music.tracks.length) % music.tracks.length;
+  const t = music.tracks[music.idx];
+  const saved = store.get("music.pos", null);
+  audio.src = `/music/${encodeURIComponent(t.file)}?t=${encodeURIComponent(TOKEN)}`;
+  // Les pistes durent souvent des heures : on reprend là où on s'était arrêté.
+  if (saved?.file === t.file && saved.t > 5) audio.addEventListener("loadedmetadata", () => { audio.currentTime = saved.t; }, { once: true });
+  store.set("music.track", t.file);
+  renderPlayer();
+  if (play) playMusic();
+}
+
+async function playMusic() {
+  if (!music.tracks?.length) return;
+  if (!audio.getAttribute("src")) return setTrack(music.idx, true);
+  try { await audio.play(); } catch (e) { if (e.name !== "AbortError") toast("Lecture impossible : " + e.message, "error"); }
+}
+
+function onSessionStart() {
+  if (S.config.music_autoplay && audio.paused && music.tracks?.length) { music.auto = true; playMusic(); }
+}
+function onSessionEnd() {
+  if (music.auto) audio.pause();
+  music.auto = false;
+}
+
+function renderPlayer() {
+  const box = $("#player");
+  if (!music.tracks) { box.innerHTML = ""; return; }
+  const head = `<div class="p-head">${icon("music")}<span>Musique focus</span>
+    <button class="icon-btn" data-music-list aria-label="Choisir une piste" title="Pistes et réglages">${icon("list")}</button></div>`;
+  if (!music.tracks.length) {
+    box.innerHTML = `${head}<p class="p-empty">Dépose tes fichiers audio (mp3, m4a…) dans le dossier <strong>Music</strong>.</p>
+      <button class="btn small" data-music-open>${icon("folder")}Ouvrir le dossier</button>`;
+    return;
+  }
+  const t = music.tracks[music.idx];
+  const on = !audio.paused;
+  box.innerHTML = `${head}
+    <div class="p-title" title="${esc(t.title)}">${esc(t.title)}</div>
+    <input type="range" class="p-seek" id="p-seek" min="0" max="1000" step="1" value="0" aria-label="Position dans la piste">
+    <div class="p-times"><span id="p-cur">${fmtTime(audio.currentTime)}</span><span id="p-dur">${fmtTime(audio.duration)}</span></div>
+    <div class="p-controls">
+      <button class="icon-btn" data-music-prev aria-label="Piste précédente">${icon("skipBack")}</button>
+      <button class="p-play" data-music-toggle aria-label="${on ? "Pause" : "Lecture"}">${icon(on ? "pause" : "play")}</button>
+      <button class="icon-btn" data-music-next aria-label="Piste suivante">${icon("skipForward")}</button>
+      <input type="range" class="p-vol" id="p-vol" min="0" max="1" step="0.05" value="${audio.volume}" aria-label="Volume">
+    </div>`;
+  updateProgress();
+}
+
+function updateProgress() {
+  const seek = $("#p-seek");
+  if (!seek) return;
+  if (!music.seeking && Number.isFinite(audio.duration) && audio.duration > 0) seek.value = String(Math.round((audio.currentTime / audio.duration) * 1000));
+  $("#p-cur").textContent = fmtTime(music.seeking && Number.isFinite(audio.duration) ? (seek.value / 1000) * audio.duration : audio.currentTime);
+  $("#p-dur").textContent = fmtTime(audio.duration);
+}
+
+function openMusicDialog() {
+  const list = music.tracks ?? [];
+  const d = showDialog(`
+    <h2 id="dialog-title">Musique focus</h2>
+    <p class="lead">${plural(list.length, "piste", "pistes")} dans <span class="path">${esc(music.folder)}</span></p>
+    <div class="track-list">${list.map((t, i) => `<button class="track ${i === music.idx ? "current" : ""}" data-track="${i}"
+      ${i === music.idx ? 'aria-current="true"' : ""}>${icon(i === music.idx && !audio.paused ? "music" : "play")}<span>${esc(t.title)}</span></button>`).join("")
+      || '<p class="helper">Aucun fichier audio pour l\'instant.</p>'}</div>
+    <div class="toggle-row ${S.config.music_autoplay ? "on" : ""}" style="margin-top:14px">
+      <div class="ico">${icon("timer")}</div>
+      <div class="txt"><div class="title" id="t-autoplay">Lancer avec la session</div><div class="desc">La musique démarre au début de chaque session et s'arrête à la fin.</div></div>
+      <button class="switch" role="switch" data-autoplay aria-labelledby="t-autoplay" aria-checked="${!!S.config.music_autoplay}"></button>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn ghost" data-music-open>${icon("folder")}Ouvrir le dossier</button>
+      <button class="btn ghost" data-music-refresh>${icon("refresh")}Actualiser</button>
+      <button class="btn primary" data-close>Fermer</button>
+    </div>`, closeDialog);
+  $$("[data-track]", d).forEach((b) => b.addEventListener("click", () => { setTrack(+b.dataset.track); closeDialog(); }));
+  $("[data-close]", d).addEventListener("click", closeDialog);
+  $("[data-music-open]", d).addEventListener("click", openMusicFolder);
+  $("[data-music-refresh]", d).addEventListener("click", async () => { await loadMusic(); openMusicDialog(); toast("Liste actualisée"); });
+  $("[data-autoplay]", d).addEventListener("click", async (e) => {
+    const v = !S.config.music_autoplay;
+    e.currentTarget.setAttribute("aria-checked", v);
+    e.currentTarget.closest(".toggle-row").classList.toggle("on", v);
+    try { S.config = (await api("/api/config", { music_autoplay: v })).config; } catch (err) { toast(err.message, "error"); }
+  });
+  ($(".track.current", d) || $("[data-close]", d)).focus();
+}
+
+async function openMusicFolder() {
+  try { await api("/api/music/open", {}); } catch (e) { toast(e.message, "error"); }
+}
+
+$("#player").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.matches("[data-music-toggle]")) audio.paused ? playMusic() : audio.pause();
+  else if (b.matches("[data-music-prev]")) setTrack(audio.currentTime > 5 ? music.idx : music.idx - 1);
+  else if (b.matches("[data-music-next]")) setTrack(music.idx + 1);
+  else if (b.matches("[data-music-list]")) openMusicDialog();
+  else if (b.matches("[data-music-open]")) openMusicFolder();
+});
+$("#player").addEventListener("input", (e) => {
+  if (e.target.id === "p-vol") { audio.volume = +e.target.value; store.set("music.volume", audio.volume); }
+  if (e.target.id === "p-seek") { music.seeking = true; updateProgress(); }
+});
+$("#player").addEventListener("change", (e) => {
+  if (e.target.id !== "p-seek") return;
+  if (Number.isFinite(audio.duration)) audio.currentTime = (+e.target.value / 1000) * audio.duration;
+  music.seeking = false;
+});
+audio.addEventListener("play", () => { renderPlayer(); if (page === "session" && S?.session) render(); });
+audio.addEventListener("pause", renderPlayer);
+audio.addEventListener("loadedmetadata", updateProgress);
+audio.addEventListener("timeupdate", () => {
+  updateProgress();
+  if (Date.now() - music.savedAt > 5000 && music.tracks?.[music.idx]) {
+    music.savedAt = Date.now();
+    store.set("music.pos", { file: music.tracks[music.idx].file, t: audio.currentTime });
+  }
+});
+audio.addEventListener("ended", () => { store.set("music.pos", null); setTrack(music.idx + 1); });
+audio.addEventListener("error", () => {
+  if (!audio.getAttribute("src")) return;
+  toast(`Impossible de lire « ${music.tracks?.[music.idx]?.title ?? "cette piste"} ».`, "error");
+  renderPlayer();
+});
+
 // --- Raccourcis clavier ------------------------------------------------------------------
 document.addEventListener("keydown", (e) => {
   if (e.key === "/" && !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName) && !$("#dialog").open) {
@@ -894,3 +1062,4 @@ document.addEventListener("keydown", (e) => {
 
 poll();
 setInterval(poll, 1000);
+loadMusic();

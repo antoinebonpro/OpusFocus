@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 .claude-flow/
 .playwright-mcp/
+dist/
+build/tmp/
+build/icon.ico
+.venv-build/
+Music/
