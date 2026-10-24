@@ -1,0 +1,20 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'expo.modules.focusblocker'
+version = '1.0.0'
+
+android {
+  namespace "expo.modules.focusblocker"
+  defaultConfig {
+    versionCode 1
+    versionName '1.0.0'
+  }
+}
+
+dependencies {
+  // Tests JVM du filtrage DNS : gradlew :focus-blocker:testDebugUnitTest
+  testImplementation 'junit:junit:4.13.2'
+}

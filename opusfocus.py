@@ -19,10 +19,12 @@ import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,25 +39,32 @@ FROZEN = getattr(sys, "frozen", False)  # empaqueté en .exe par PyInstaller
 # En .exe, les fichiers embarqués (ui/, scan_apps.ps1) sont extraits dans sys._MEIPASS.
 ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 UI_DIR = ROOT / "ui"
-# Dossier à côté du .exe (ou du script) : c'est là que l'utilisateur dépose sa musique.
-APP_HOME = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent
-MUSIC_DIR = APP_HOME / "Music"
-# Nom interne d'origine conservé (dossier de données, verrou, marqueurs hosts) : rien n'est perdu au renommage.
-APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "DeepWorkFocus"
+# Application installée : la musique est dans « Musique\OpusFocus ». En développement : le dossier Music du projet.
+MUSIC_DIR = Path.home() / "Music" / APP_NAME if FROZEN else Path(__file__).resolve().parent / "Music"
+APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME
+# Dossier des versions nommées « Deep Work Focus » : repris au premier lancement, rien n'est perdu.
+LEGACY_APP_DIR = APP_DIR.with_name("DeepWorkFocus")
 CONFIG_FILE = APP_DIR / "config.json"
 SESSIONS_FILE = APP_DIR / "sessions.json"
 STATE_FILE = APP_DIR / "state.json"
 APPS_CACHE = APP_DIR / "apps.json"
 SERVER_FILE = APP_DIR / "server.json"
+# Dernier port et jeton utilisés : un moteur relancé les reprend, et la fenêtre restée ouverte se reconnecte.
+ENDPOINT_FILE = APP_DIR / "endpoint.json"
+ERROR_LOG = APP_DIR / "erreurs.log"
 WINDOW_PROFILE = APP_DIR / "fenetre"
 HOSTS_FILE = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "drivers" / "etc" / "hosts"
 
-HOSTS_START = "# >>> DeepWorkFocus (ne pas modifier)"
-HOSTS_END = "# <<< DeepWorkFocus"
+HOSTS_START = "# >>> OpusFocus (ne pas modifier)"
+HOSTS_END = "# <<< OpusFocus"
+# Marqueurs des anciennes versions : un bloc laissé par l'une d'elles est retiré lui aussi.
+HOSTS_MARKERS = ((HOSTS_START, HOSTS_END), ("# >>> DeepWorkFocus (ne pas modifier)", "# <<< DeepWorkFocus"))
 CREATE_NO_WINDOW = 0x08000000
-ABANDON_PHRASE = "j'abandonne ma session de deep work"
+ABANDON_PHRASE = "j'abandonne ma session de deep work"  # par défaut, modifiable dans les réglages
+PHRASE_MIN, PHRASE_MAX = 10, 150
 IDLE_EXIT_SECONDS = 25
-MUTEX_NAME = "Local\\DeepWorkFocus"
+MUTEX_NAME = "Local\\OpusFocus"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUDIO_TYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".mp4": "audio/mp4", ".aac": "audio/aac",
                ".ogg": "audio/ogg", ".opus": "audio/ogg", ".wav": "audio/wav", ".flac": "audio/flac",
                ".webm": "audio/webm"}
@@ -66,7 +75,7 @@ NOTIF_KEYS = [
 ]
 
 # Processus qu'on ne tue jamais.
-PROTECTED = {"explorer.exe", "python.exe", "pythonw.exe", "opusfocus.exe", "deepworkfocus.exe", "svchost.exe", "csrss.exe", "winlogon.exe",
+PROTECTED = {"explorer.exe", "python.exe", "pythonw.exe", "opusfocus.exe", "svchost.exe", "csrss.exe", "winlogon.exe",
              "dwm.exe", "taskmgr.exe", "system", "lsass.exe", "msedgewebview2.exe",
              "conhost.exe", "powershell.exe", "searchhost.exe", "startmenuexperiencehost.exe"}
 # Navigateurs pouvant afficher la fenêtre de l'application (par ordre de préférence).
@@ -81,6 +90,7 @@ DEFAULT_CONFIG = {
     "weekly_goal_hours": 15,
     "music_autoplay": False,
     "default_minutes": 90,
+    "launch_at_startup": True,
     "shutdown_checklist": [
         "J'ai vérifié mes e-mails et messages une dernière fois",
         "J'ai noté chaque tâche en suspens dans ma liste",
@@ -133,10 +143,65 @@ def save_json(path: Path, data) -> None:
     tmp.replace(path)
 
 
+def log_error() -> None:
+    """Ajoute l'erreur en cours au journal (gardé court). Un .exe fenêtré n'a pas de console pour l'afficher."""
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        old = ERROR_LOG.read_text(encoding="utf-8")[-50_000:] if ERROR_LOG.exists() else ""
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        ERROR_LOG.write_text(f"{old}\n[{stamp}]\n{traceback.format_exc()}", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def load_config() -> dict:
     cfg = dict(DEFAULT_CONFIG)
     cfg.update(load_json(CONFIG_FILE, {}))
     return cfg
+
+
+# Fichiers de données repris des anciennes versions (le profil de navigateur « fenetre » est recréé).
+LEGACY_FILES = ("config.json", "sessions.json", "state.json", "apps.json", "endpoint.json", "erreurs.log")
+
+
+def migrate_legacy_data() -> bool:
+    """Reprend les données des versions « Deep Work Focus » (réglages, historique, session en cours).
+
+    Copie fichier par fichier, sans jamais écraser : l'ancien dossier peut être verrouillé par une fenêtre
+    encore ouverte, et le nouveau peut déjà exister. L'ancien dossier reste en place comme sauvegarde.
+    """
+    if not LEGACY_APP_DIR.is_dir():
+        return False
+    copied = False
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    for name in LEGACY_FILES:
+        src, dst = LEGACY_APP_DIR / name, APP_DIR / name
+        if src.is_file() and not dst.exists():
+            try:
+                shutil.copy2(src, dst)
+                copied = True
+            except OSError:
+                log_error()
+    return copied
+
+
+# --- Lancement au démarrage de Windows -------------------------------------------
+def startup_command() -> str:
+    if FROZEN:
+        return f'"{sys.executable}" --startup'
+    return f'"{pythonw()}" "{Path(__file__).resolve()}" --startup'
+
+
+def set_launch_at_startup(enabled: bool) -> None:
+    """Ajoute ou retire OpusFocus des programmes lancés à l'ouverture de session (sans droits admin)."""
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, APP_NAME)
+            except FileNotFoundError:
+                pass
 
 
 # --- Blocage système -----------------------------------------------------------
@@ -208,6 +273,11 @@ def clean_domain(site: str) -> str:
     return site if DOMAIN_RE.match(site) else ""
 
 
+def clean_phrase(text: str) -> str:
+    """Phrase d'abandon comparable : minuscules, espaces superflus retirés, apostrophe typographique unifiée."""
+    return " ".join(text.replace("’", "'").lower().split())
+
+
 def clean_app(name: str) -> str:
     name = name.strip().lower()
     name = name if name.endswith(".exe") else name + ".exe"
@@ -215,12 +285,13 @@ def clean_app(name: str) -> str:
 
 
 def strip_hosts_block(content: str) -> str:
+    starts, ends = {s for s, _ in HOSTS_MARKERS}, {e for _, e in HOSTS_MARKERS}
     out, skipping = [], False
     for line in content.splitlines():
-        if line.strip() == HOSTS_START:
+        if line.strip() in starts:
             skipping = True
             continue
-        if line.strip() == HOSTS_END:
+        if line.strip() in ends:
             skipping = False
             continue
         if not skipping:
@@ -253,7 +324,7 @@ def block_sites(sites: list[str], hosts: Path = HOSTS_FILE) -> None:
 
 def unblock_sites(hosts: Path = HOSTS_FILE) -> None:
     content = hosts.read_text(encoding="utf-8", errors="ignore")
-    if HOSTS_START in content:
+    if any(start in content for start, _ in HOSTS_MARKERS):
         hosts.write_text(strip_hosts_block(content), encoding="utf-8")
         flush_dns()
 
@@ -344,27 +415,45 @@ def acquire_single_instance(timeout: float = 0.0):
         time.sleep(0.2)
 
 
+def app_window_pids(profile: Path | None = None) -> set[int]:
+    """Processus principaux du navigateur lancé avec le profil dédié de l'application."""
+    marker, pids = str(profile or WINDOW_PROFILE).lower(), set()
+    for pid, name in list_processes():
+        if name in WINDOW_BROWSERS:
+            cmd = process_command_line(pid).lower()
+            if marker in cmd and "--type=" not in cmd:
+                pids.add(pid)
+    return pids
+
+
 def find_app_window():
-    """Fenêtre de l'application (reconnue à son profil de navigateur dédié), ou None."""
-    marker, found, cmdlines = str(WINDOW_PROFILE).lower(), [], {}
+    """Fenêtre de l'application, ou None. On la reconnaît à son navigateur dédié, pas à son titre :
+    celui-ci change (minuteur, ancienne version) et ne doit jamais faire croire que la fenêtre est fermée."""
+    pids = app_window_pids()
+    if not pids:
+        return None
+    found = []
 
     def visit(hwnd, _):
-        n = _user32.GetWindowTextLengthW(hwnd)
-        if n and _user32.IsWindowVisible(hwnd):
-            buf = ctypes.create_unicode_buffer(n + 1)
-            _user32.GetWindowTextW(hwnd, buf, n + 1)
-            if buf.value == APP_NAME or buf.value.endswith(f" · {APP_NAME}"):
-                pid = ctypes.c_ulong()
-                _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if pid.value not in cmdlines:
-                    cmdlines[pid.value] = process_command_line(pid.value).lower()
-                if marker in cmdlines[pid.value]:
-                    found.append(hwnd)
-                    return False
+        if _user32.IsWindowVisible(hwnd) and _user32.GetWindowTextLengthW(hwnd):
+            pid = ctypes.c_ulong()
+            _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids:
+                found.append(hwnd)
+                return False
         return True
 
     _user32.EnumWindows(_WNDENUMPROC(visit), None)
     return found[0] if found else None
+
+
+def close_app_window(profile: Path | None = None) -> None:
+    """Ferme la fenêtre de l'application (et elle seule : profil de navigateur dédié)."""
+    for pid in app_window_pids(profile):
+        handle = _kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+        if handle:
+            _kernel32.TerminateProcess(handle, 0)
+            _kernel32.CloseHandle(handle)
 
 
 def focus_window() -> bool:
@@ -541,6 +630,7 @@ class Engine:
         self.on_idle = None
         self.notice = ""
         self.window_opened_at = 0.0
+        self.ui_seen = False  # une fenêtre a interrogé ce moteur depuis son démarrage
         self._recover()
 
     # ----- Cycle de vie
@@ -565,29 +655,56 @@ class Engine:
     def run_forever(self):
         while True:
             time.sleep(1.5)
-            with self.lock:
-                st = self.session
-                apps = list(self.config["apps"]) if st and st.get("apps") else []
-                if st and time.time() >= st["end"]:
-                    self._finish(completed=True)
-                    continue
-                idle = not st and not self.review_id and time.time() - self.last_seen > IDLE_EXIT_SECONDS
-            if idle and find_app_window():
-                # Fenêtre réduite : le navigateur ralentit ses appels, mais elle est toujours là.
-                self.last_seen, idle = time.time(), False
-            if idle and self.on_idle:
-                self.on_idle()
-                return
-            if apps:
-                try:
-                    killed = kill_blocked(apps)
-                except OSError:
-                    killed = []
-                if killed:
-                    with self.lock:
-                        if self.session:
-                            self.session["blocked_count"] += len(killed)
-                            self.session["last_killed"] = {"names": killed, "at": time.time()}
+            try:
+                if self._tick():
+                    return
+            except Exception:  # noqa: BLE001 — une erreur imprévue ne doit jamais arrêter la surveillance
+                log_error()
+
+    def _tick(self) -> bool:
+        """Un tour de surveillance. Renvoie True quand le moteur doit s'arrêter (aucune fenêtre ouverte)."""
+        with self.lock:
+            st = self.session
+            apps = list(self.config["apps"]) if st and st.get("apps") else []
+            if st and time.time() >= st["end"]:
+                self._finish(completed=True)
+                return False
+            idle = not st and not self.review_id and time.time() - self.last_seen > IDLE_EXIT_SECONDS
+        if idle and find_app_window():
+            # Fenêtre réduite ou en arrière-plan : le navigateur ralentit ses appels, mais elle est toujours là.
+            self.last_seen, idle = time.time(), False
+        if idle and self.on_idle:
+            self.on_idle()
+            return True
+        if apps:
+            try:
+                killed = kill_blocked(apps)
+            except OSError:
+                killed = []
+            if killed:
+                with self.lock:
+                    if self.session:
+                        self.session["blocked_count"] += len(killed)
+                        self.session["last_killed"] = {"names": killed, "at": time.time()}
+        return False
+
+    def ensure_window(self):
+        """Au démarrage : une fenêtre restée ouverte se reconnecte seule (même port, même jeton).
+        Si elle n'y arrive pas (port changé), on la remplace au lieu de ramener une fenêtre morte."""
+        # Une fenêtre des versions « Deep Work Focus » ne peut plus se reconnecter : on la remplace.
+        close_app_window(LEGACY_APP_DIR / "fenetre")
+        if find_app_window():
+            end = time.time() + 5
+            while time.time() < end:
+                if self.ui_seen:
+                    focus_window()
+                    return
+                time.sleep(0.25)
+            close_app_window()
+            end = time.time() + 3
+            while find_app_window() and time.time() < end:  # sinon show_window ramènerait la fenêtre fermée
+                time.sleep(0.2)
+        self.show_window()
 
     # ----- Blocages
     def _apply_blocks(self):
@@ -655,6 +772,7 @@ class Engine:
     # ----- Actions de l'interface
     def snapshot(self) -> dict:
         self.last_seen = time.time()
+        self.ui_seen = True
         with self.lock:
             notice, self.notice = self.notice, ""
             session = None
@@ -666,8 +784,14 @@ class Engine:
             return {
                 "now": time.time(), "admin": self.admin, "config": self.config, "session": session,
                 "review": review, "sessions": self.sessions, "notice": notice,
-                "today": dt.date.today().isoformat(), "abandon_phrase": ABANDON_PHRASE,
+                "today": dt.date.today().isoformat(), "abandon_phrase": self.abandon_phrase(),
             }
+
+    def abandon_phrase(self) -> str:
+        """Phrase à taper pour arrêter : celle de la session en cours (fixée au départ), sinon celle des réglages."""
+        if self.session and self.session.get("phrase"):
+            return self.session["phrase"]
+        return clean_phrase(self.config.get("abandon_phrase", "")) or ABANDON_PHRASE
 
     def start(self, data: dict):
         with self.lock:
@@ -687,6 +811,7 @@ class Engine:
                 "notif": bool(data.get("notif")), "apps": bool(data.get("apps")),
                 "sites": bool(data.get("sites")) and self.admin, "lock": bool(data.get("lock")),
                 "notif_prev": {}, "blocked_count": 0, "last_killed": None,
+                "phrase": self.abandon_phrase(),
             }
             self.review_id = None
             self.config["default_minutes"] = minutes
@@ -700,7 +825,7 @@ class Engine:
         with self.lock:
             if not self.session:
                 return {}
-            if self.session["lock"] and str(data.get("phrase", "")).strip().lower() != ABANDON_PHRASE:
+            if self.session["lock"] and clean_phrase(str(data.get("phrase", ""))) != self.abandon_phrase():
                 raise ApiError("La phrase ne correspond pas. Ta session continue.")
             self._finish(completed=False)
         return {}
@@ -735,6 +860,16 @@ class Engine:
                     block_sites(sites)
             if "music_autoplay" in data:
                 cfg["music_autoplay"] = bool(data["music_autoplay"])
+            if "abandon_phrase" in data:
+                if st and st["lock"]:
+                    raise ApiError("Mode engagement : la phrase d'abandon se change après la session.")
+                phrase = clean_phrase(str(data["abandon_phrase"]))
+                if not PHRASE_MIN <= len(phrase) <= PHRASE_MAX:
+                    raise ApiError(f"La phrase doit faire entre {PHRASE_MIN} et {PHRASE_MAX} caractères.")
+                cfg["abandon_phrase"] = phrase
+            if "launch_at_startup" in data:
+                set_launch_at_startup(bool(data["launch_at_startup"]))
+                cfg["launch_at_startup"] = bool(data["launch_at_startup"])
             if "weekly_goal_hours" in data:
                 cfg["weekly_goal_hours"] = max(1, min(80, _int(data["weekly_goal_hours"], "Objectif invalide.")))
             if "shutdown_checklist" in data:
@@ -909,6 +1044,11 @@ def make_handler(engine: Engine, token: str, port_ref: list):
     return Handler
 
 
+class Server(ThreadingHTTPServer):
+    # Sous Windows, SO_REUSEADDR permettrait de prendre un port déjà utilisé par un autre programme.
+    allow_reuse_address = False
+
+
 def ping(port: int, token: str) -> bool:
     req = urllib.request.Request(f"http://127.0.0.1:{port}/api/ping", headers={"X-Token": token})
     try:
@@ -940,6 +1080,7 @@ def show_existing_instance(timeout: float = 15.0) -> None:
 
 
 def main():
+    migrate_legacy_data()
     APP_DIR.mkdir(parents=True, exist_ok=True)
     replace = "--replace" in sys.argv
     previous = load_json(SERVER_FILE, {})
@@ -968,25 +1109,32 @@ def main():
         pass
 
     engine = Engine()
-    port_ref = [0]
-    token = previous.get("token") if replace and previous else secrets.token_urlsafe(24)
-    server = None
-    if replace and previous:
+    if FROZEN:
+        # L'application installée suit le réglage (le script de développement ne s'inscrit jamais seul).
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", previous["port"]), make_handler(engine, token, port_ref))
+            set_launch_at_startup(engine.config.get("launch_at_startup", True))
         except OSError:
-            server = None
-    reopen = server is None
+            log_error()
+    port_ref = [0]
+    # Port et jeton repris de la dernière fois : une fenêtre restée ouverte se reconnecte d'elle-même.
+    last = previous if replace and previous else load_json(ENDPOINT_FILE, {})
+    token = last.get("token") if isinstance(last.get("token"), str) and len(last["token"]) >= 24 else secrets.token_urlsafe(24)
+    server = None
+    if isinstance(last.get("port"), int):
+        try:
+            server = Server(("127.0.0.1", last["port"]), make_handler(engine, token, port_ref))
+        except OSError:
+            server = None  # port pris entre-temps : on en prend un autre, la fenêtre sera remplacée
     if server is None:
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(engine, token, port_ref))
+        server = Server(("127.0.0.1", 0), make_handler(engine, token, port_ref))
     port_ref[0] = server.server_address[1]
     engine.url = f"http://127.0.0.1:{port_ref[0]}/"
     save_json(SERVER_FILE, {"port": port_ref[0], "token": token, "pid": os.getpid()})
+    save_json(ENDPOINT_FILE, {"port": port_ref[0], "token": token})
 
     engine.on_idle = lambda: threading.Thread(target=server.shutdown, daemon=True).start()
     threading.Thread(target=engine.run_forever, daemon=True).start()
-    if reopen:
-        engine.show_window()
+    threading.Thread(target=engine.ensure_window, daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.5)
     finally:

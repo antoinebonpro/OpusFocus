@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Icône de notification (monochrome) : la cible du logo OpusFocus. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+  android:width="24dp"
+  android:height="24dp"
+  android:viewportWidth="24"
+  android:viewportHeight="24">
+  <path
+    android:fillColor="#FFFFFFFF"
+    android:fillType="evenOdd"
+    android:pathData="M12,2.5a9.5,9.5 0,1 1,0 19a9.5,9.5 0,1 1,0 -19zM12,5a7,7 0,1 0,0 14a7,7 0,1 0,0 -14zM12,9.25a2.75,2.75 0,1 1,0 5.5a2.75,2.75 0,1 1,0 -5.5z" />
+</vector>

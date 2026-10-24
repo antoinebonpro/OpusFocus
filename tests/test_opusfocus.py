@@ -1,5 +1,5 @@
 """
-Batterie de tests de Deep Work Focus (bibliothèque standard uniquement).
+Batterie de tests d'OpusFocus (bibliothèque standard uniquement).
 
     python -m unittest discover -s tests -v
 
@@ -23,11 +23,11 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-TMP = Path(tempfile.mkdtemp(prefix="dwtest_"))
+TMP = Path(tempfile.mkdtemp(prefix="opusfocus_test_"))
 os.environ["APPDATA"] = str(TMP / "appdata")  # avant l'import : APP_DIR en dépend
 sys.path.insert(0, str(ROOT))
 
-import deepwork as dw  # noqa: E402
+import opusfocus as dw  # noqa: E402
 
 FAKE_HOSTS = TMP / "hosts"
 
@@ -52,6 +52,7 @@ class Sandbox(unittest.TestCase):
             mock.patch.object(dw, "relaunch_as_admin", lambda: False),
             mock.patch.object(dw.winsound, "MessageBeep", lambda *a: None),
             mock.patch.object(dw, "is_admin", lambda: True),
+            mock.patch.object(dw, "set_launch_at_startup", self._startup),
         ]
         for p in patches:
             p.start()
@@ -60,6 +61,9 @@ class Sandbox(unittest.TestCase):
     def _notif_off(self):
         self.notif_state["off"] = True
         return {"k|v": 1}
+
+    def _startup(self, enabled):
+        self.startup_state = enabled
 
     def _notif_restore(self, previous):
         self.notif_state["restored"] = previous
@@ -123,6 +127,21 @@ class TestHostsFile(unittest.TestCase):
             self.assertIn(ip, ("0.0.0.0", "::1"))
             self.assertNotIn("bank", host)
             self.assertNotIn("1.1.1.1", line)
+
+    def test_legacy_block_is_removed(self):
+        # Un bloc écrit par une version « Deep Work Focus » est retiré comme le bloc actuel.
+        legacy = "127.0.0.1 localhost\n# >>> DeepWorkFocus (ne pas modifier)\n0.0.0.0 x.com\n# <<< DeepWorkFocus\n"
+        self.assertEqual(dw.strip_hosts_block(legacy), "127.0.0.1 localhost\n")
+        f = TMP / "hosts_legacy"
+        f.write_text(legacy, encoding="utf-8")
+        with mock.patch.object(dw, "flush_dns", lambda: None):
+            dw.unblock_sites(f)
+        self.assertNotIn("x.com", f.read_text(encoding="utf-8"))
+
+    def test_block_markers_use_new_name(self):
+        block = dw.build_hosts_block(["x.com"])
+        self.assertTrue(block.startswith("# >>> OpusFocus"))
+        self.assertNotIn("DeepWork", block)
 
     def test_unblock_without_block_does_not_touch_file(self):
         f = TMP / "hosts_untouched"
@@ -197,6 +216,41 @@ class TestEngine(Sandbox):
         self.assertIsNotNone(e.session)
         e.stop({"phrase": "  J'abandonne ma session de DEEP WORK "})
         self.assertIsNone(e.session)
+
+    def test_custom_abandon_phrase(self):
+        e = dw.Engine()
+        e.update_config({"abandon_phrase": "  Je  choisis la FACILITÉ plutôt que mon objectif "})
+        self.assertEqual(e.config["abandon_phrase"], "je choisis la facilité plutôt que mon objectif")
+        self.assertEqual(e.snapshot()["abandon_phrase"], "je choisis la facilité plutôt que mon objectif")
+        self.start(e, lock=True)
+        with self.assertRaises(dw.ApiError):
+            e.stop({"phrase": dw.ABANDON_PHRASE})  # l'ancienne phrase ne marche plus
+        e.stop({"phrase": "Je choisis la facilité plutôt que mon objectif"})
+        self.assertIsNone(e.session)
+        self.assertTrue(dw.load_config()["abandon_phrase"].startswith("je choisis"))
+
+    def test_abandon_phrase_typographic_apostrophe(self):
+        e = dw.Engine()
+        self.start(e, lock=True)
+        e.stop({"phrase": "j’abandonne ma session de deep work"})  # apostrophe du clavier mobile
+        self.assertIsNone(e.session)
+
+    def test_abandon_phrase_validation(self):
+        e = dw.Engine()
+        for bad in ("court", "x" * 151, "          "):
+            with self.subTest(bad=bad), self.assertRaises(dw.ApiError):
+                e.update_config({"abandon_phrase": bad})
+        self.assertEqual(e.snapshot()["abandon_phrase"], dw.ABANDON_PHRASE)
+
+    def test_abandon_phrase_frozen_during_locked_session(self):
+        e = dw.Engine()
+        self.start(e, lock=True)
+        with self.assertRaises(dw.ApiError):
+            e.update_config({"abandon_phrase": "une phrase bien plus facile"})
+        self.assertEqual(e.snapshot()["abandon_phrase"], dw.ABANDON_PHRASE)
+        e.stop({"phrase": dw.ABANDON_PHRASE})
+        e.update_config({"abandon_phrase": "une phrase bien plus facile"})  # permis après la session
+        self.assertEqual(e.snapshot()["abandon_phrase"], "une phrase bien plus facile")
 
     def test_live_site_update_rewrites_hosts(self):
         e = dw.Engine()
@@ -386,8 +440,8 @@ class TestHttp(Sandbox):
         self.assertNotEqual(r.status, 200)
 
     def test_path_traversal(self):
-        for path in ("/../deepwork.py", "/..%2fdeepwork.py", "/ui/../deepwork.py", "/%2e%2e/deepwork.py",
-                     "/index.html", "/deepwork.py", "//etc/hosts", "/C:/Windows/win.ini"):
+        for path in ("/../opusfocus.py", "/..%2fopusfocus.py", "/ui/../opusfocus.py", "/%2e%2e/opusfocus.py",
+                     "/index.html", "/opusfocus.py", "//etc/hosts", "/C:/Windows/win.ini"):
             with self.subTest(path=path):
                 r, body = self.req("GET", path, token=False)
                 self.assertIn(r.status, (403, 404))
@@ -492,6 +546,16 @@ class TestHttp(Sandbox):
         self.assertTrue(json.loads(body)["config"]["music_autoplay"])
         self.assertTrue(dw.load_config()["music_autoplay"])
 
+    def test_launch_at_startup_setting(self):
+        self.assertTrue(self.engine.config["launch_at_startup"])
+        r, body = self.req("POST", "/api/config", {"launch_at_startup": False})
+        self.assertEqual(r.status, 200)
+        self.assertFalse(json.loads(body)["config"]["launch_at_startup"])
+        self.assertIs(self.startup_state, False)
+        self.assertFalse(dw.load_config()["launch_at_startup"])
+        self.req("POST", "/api/config", {"launch_at_startup": True})
+        self.assertIs(self.startup_state, True)
+
     def test_csp_allows_local_media_only(self):
         r, _ = self.req("GET", "/", token=False)
         self.assertIn("media-src 'self'", r.getheader("Content-Security-Policy"))
@@ -519,7 +583,7 @@ class TestMusicHelpers(unittest.TestCase):
 
 class TestSingleInstance(unittest.TestCase):
     def test_second_acquire_fails_until_release(self):
-        with mock.patch.object(dw, "MUTEX_NAME", f"Local\\DeepWorkFocusTest{os.getpid()}"):
+        with mock.patch.object(dw, "MUTEX_NAME", f"Local\\OpusFocusTest{os.getpid()}"):
             first = dw.acquire_single_instance()
             self.assertTrue(first)
             try:
@@ -552,6 +616,60 @@ class TestSingleInstance(unittest.TestCase):
         with mock.patch.object(dw, "open_window", opened.append), mock.patch.object(dw, "focus_window", lambda: False):
             engine.show_window()
             self.assertEqual(len(opened), 3)  # fermée juste après être apparue : relancer la rouvre aussitôt
+
+    def _engine(self):
+        engine = dw.Engine.__new__(dw.Engine)
+        engine.lock, engine.url, engine.window_opened_at = dw.threading.RLock(), "http://127.0.0.1:1/", 0.0
+        engine.ui_seen = False
+        return engine
+
+    def test_stale_window_is_replaced_not_focused(self):
+        # Fenêtre d'un moteur précédent qui ne se reconnecte pas : on la ferme et on en ouvre une neuve.
+        engine, opened, closed = self._engine(), [], []
+        windows = [1]
+        with mock.patch.object(dw, "find_app_window", lambda: windows[0] if windows else None), \
+                mock.patch.object(dw, "close_app_window", lambda profile=None: profile or (closed.append(1), windows.clear())), \
+                mock.patch.object(dw, "focus_window", lambda: bool(windows)), \
+                mock.patch.object(dw, "open_window", opened.append), mock.patch.object(dw.time, "sleep", lambda s: None):
+            real_time = time.time
+            clock = [real_time()]
+            with mock.patch.object(dw.time, "time", lambda: (clock.__setitem__(0, clock[0] + 0.5), clock[0])[1]):
+                engine.ensure_window()
+        self.assertEqual(closed, [1])
+        self.assertEqual(opened, ["http://127.0.0.1:1/"])
+
+    def test_reconnecting_window_is_kept(self):
+        # Même port et même jeton : la fenêtre se reconnecte, on la garde et on la ramène au premier plan.
+        engine, opened, closed, focused, legacy = self._engine(), [], [], [], []
+        engine.ui_seen = True
+        with mock.patch.object(dw, "find_app_window", lambda: 1), \
+                mock.patch.object(dw, "close_app_window", lambda profile=None: legacy.append(profile) if profile else closed.append(1)), \
+                mock.patch.object(dw, "focus_window", lambda: focused.append(1) or True), \
+                mock.patch.object(dw, "open_window", opened.append):
+            engine.ensure_window()
+        self.assertEqual((opened, closed, focused), ([], [], [1]))
+        # Seule une fenêtre d'une ancienne version (profil « DeepWorkFocus ») est fermée d'office.
+        self.assertEqual(legacy, [dw.LEGACY_APP_DIR / "fenetre"])
+
+    def test_unexpected_error_does_not_stop_monitoring(self):
+        engine, calls = self._engine(), []
+
+        def tick():
+            calls.append(1)
+            if len(calls) == 1:
+                raise KeyError("imprévu")
+            return True
+
+        engine._tick = tick
+        with mock.patch.object(dw.time, "sleep", lambda s: None), mock.patch.object(dw, "log_error") as log:
+            engine.run_forever()
+        self.assertEqual(len(calls), 2)
+        log.assert_called_once()
+
+    def test_window_detection_ignores_title(self):
+        # Aucun navigateur avec le profil dédié : pas de fenêtre, quel que soit le titre des autres fenêtres.
+        with mock.patch.object(dw, "app_window_pids", lambda: set()):
+            self.assertIsNone(dw.find_app_window())
 
     def test_focus_window_ignores_other_windows(self):
         # Aucune fenêtre de l'application n'est ouverte pendant les tests : rien ne doit être activé.
@@ -651,3 +769,73 @@ def tearDownModule():
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRename(unittest.TestCase):
+    """Données et lancement au démarrage sous le nom OpusFocus."""
+
+    def test_data_folder_name(self):
+        self.assertEqual(dw.APP_DIR.name, "OpusFocus")
+        self.assertEqual(dw.LEGACY_APP_DIR.name, "DeepWorkFocus")
+
+    def _dirs(self, name):
+        root = TMP / name
+        shutil.rmtree(root, ignore_errors=True)
+        old, new = root / "DeepWorkFocus", root / "OpusFocus"
+        old.mkdir(parents=True)
+        return old, new
+
+    def test_legacy_data_is_copied(self):
+        old, new = self._dirs("migration")
+        (old / "sessions.json").write_text('[{"id": "a"}]', encoding="utf-8")
+        (old / "config.json").write_text('{"weekly_goal_hours": 9}', encoding="utf-8")
+        (old / "fenetre").mkdir()  # profil de navigateur : recréé, jamais copié
+        with mock.patch.object(dw, "APP_DIR", new), mock.patch.object(dw, "LEGACY_APP_DIR", old):
+            self.assertTrue(dw.migrate_legacy_data())
+            self.assertFalse(dw.migrate_legacy_data())  # rien de nouveau la deuxième fois
+        self.assertEqual((new / "sessions.json").read_text(encoding="utf-8"), '[{"id": "a"}]')
+        self.assertEqual((new / "config.json").read_text(encoding="utf-8"), '{"weekly_goal_hours": 9}')
+        self.assertFalse((new / "fenetre").exists())
+        self.assertTrue((old / "sessions.json").exists())  # l'ancien dossier reste en sauvegarde
+
+    def test_partial_new_folder_gets_missing_files(self):
+        # Cas réel : une fenêtre ouverte verrouillait l'ancien dossier, le nouveau a été créé vide.
+        old, new = self._dirs("migration2")
+        new.mkdir(parents=True)
+        (new / "endpoint.json").write_text('{"port": 1}', encoding="utf-8")
+        (new / "config.json").write_text('{"weekly_goal_hours": 20}', encoding="utf-8")
+        (old / "config.json").write_text('{"weekly_goal_hours": 9}', encoding="utf-8")
+        (old / "sessions.json").write_text('[{"id": "b"}]', encoding="utf-8")
+        with mock.patch.object(dw, "APP_DIR", new), mock.patch.object(dw, "LEGACY_APP_DIR", old):
+            self.assertTrue(dw.migrate_legacy_data())
+        self.assertEqual((new / "sessions.json").read_text(encoding="utf-8"), '[{"id": "b"}]')
+        self.assertEqual((new / "config.json").read_text(encoding="utf-8"), '{"weekly_goal_hours": 20}')  # jamais écrasé
+        self.assertEqual((new / "endpoint.json").read_text(encoding="utf-8"), '{"port": 1}')
+
+    def test_no_legacy_folder(self):
+        root = TMP / "migration3"
+        shutil.rmtree(root, ignore_errors=True)
+        with mock.patch.object(dw, "APP_DIR", root / "OpusFocus"), mock.patch.object(dw, "LEGACY_APP_DIR", root / "DeepWorkFocus"):
+            self.assertFalse(dw.migrate_legacy_data())
+
+    def test_startup_command(self):
+        cmd = dw.startup_command()
+        self.assertTrue(cmd.endswith("--startup"))
+        self.assertIn("opusfocus.py", cmd)
+        with mock.patch.object(dw, "FROZEN", True), mock.patch.object(dw.sys, "executable", r"C:\Apps\OpusFocus.exe"):
+            self.assertEqual(dw.startup_command(), r'"C:\Apps\OpusFocus.exe" --startup')
+
+    def test_startup_registry_roundtrip(self):
+        # Écrit sous une clé de test, jamais dans la vraie clé Run.
+        test_key = r"Software\OpusFocusTest\Run"
+        with mock.patch.object(dw, "RUN_KEY", test_key):
+            dw.set_launch_at_startup(True)
+            with dw.winreg.OpenKey(dw.winreg.HKEY_CURRENT_USER, test_key) as key:
+                self.assertEqual(dw.winreg.QueryValueEx(key, "OpusFocus")[0], dw.startup_command())
+            dw.set_launch_at_startup(False)
+            dw.set_launch_at_startup(False)  # sans erreur si déjà absent
+            with dw.winreg.OpenKey(dw.winreg.HKEY_CURRENT_USER, test_key) as key:
+                with self.assertRaises(FileNotFoundError):
+                    dw.winreg.QueryValueEx(key, "OpusFocus")
+        dw.winreg.DeleteKey(dw.winreg.HKEY_CURRENT_USER, test_key)
+        dw.winreg.DeleteKey(dw.winreg.HKEY_CURRENT_USER, r"Software\OpusFocusTest")

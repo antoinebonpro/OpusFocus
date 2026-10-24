@@ -36,6 +36,8 @@ const ICONS = {
   skipForward: '<polygon points="5 4 15 12 5 20 5 4"/><line x1="19" x2="19" y1="5" y2="19"/>',
   list: '<path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M3 6h.01"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M8 6h13"/>',
   folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+  gear: '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
+  power: '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
 };
 const icon = (name, cls = "i") => `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
@@ -47,6 +49,7 @@ const PAGES = [
   { id: "progress", label: "Progrès", icon: "chart" },
   { id: "ritual", label: "Fin de journée", icon: "moon" },
   { id: "rules", label: "Principes", icon: "book" },
+  { id: "settings", label: "Réglages", icon: "gear" },
 ];
 const CATEGORIES = {
   social: "Réseaux et messagerie", games: "Jeux", media: "Vidéo et musique", browsers: "Navigateurs", other: "Autres",
@@ -89,6 +92,8 @@ const now = () => Date.now() + clockOffset;
 const fmtClock = (ts) => new Date(ts).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
 const fmtHours = (min) => { const h = min / 60; return h >= 10 ? h.toFixed(0) : h.toFixed(1).replace(".", ","); };
 const plural = (n, one, many) => `${n} ${n > 1 ? many : one}`;
+// Même règle que le moteur : minuscules, espaces superflus retirés, apostrophe typographique unifiée.
+const cleanPhrase = (s) => s.replace(/’/g, "'").toLowerCase().split(/\s+/).filter(Boolean).join(" ");
 // 25 → « 25 min », 90 → « 1 h 30 », 120 → « 2 h ».
 const fmtDuration = (min) => {
   const h = Math.floor(min / 60), m = min % 60;
@@ -186,9 +191,9 @@ window.addEventListener("hashchange", () => {
 
 function render() {
   if (!S) return;
-  const views = { session: viewSession, apps: viewApps, sites: viewSites, progress: viewProgress, ritual: viewRitual, rules: viewRules };
+  const views = { session: viewSession, apps: viewApps, sites: viewSites, progress: viewProgress, ritual: viewRitual, rules: viewRules, settings: viewSettings };
   $("#main").innerHTML = `<div class="page">${views[page]()}</div>`;
-  const binders = { session: bindSession, apps: bindApps, sites: bindSites, progress: bindProgress, ritual: bindRitual };
+  const binders = { session: bindSession, apps: bindApps, sites: bindSites, progress: bindProgress, ritual: bindRitual, settings: bindSettings };
   binders[page]?.();
 }
 
@@ -414,7 +419,7 @@ function openAbandon() {
     </div>`, closeDialog);
   const input = $("#phrase", d), btn = $("[data-abandon]", d);
   input.addEventListener("paste", (e) => e.preventDefault());
-  input.addEventListener("input", () => (btn.disabled = input.value.trim().toLowerCase() !== phrase));
+  input.addEventListener("input", () => (btn.disabled = cleanPhrase(input.value) !== phrase));
   $("[data-keep]", d).addEventListener("click", closeDialog);
   $("[data-keep]", d).focus();
   btn.addEventListener("click", async () => {
@@ -903,6 +908,73 @@ function viewRules() {
         <ul><li>Demande-toi combien de mois un jeune diplômé mettrait à apprendre à faire cette tâche : plus c'est court, plus elle est superficielle.</li>
           <li>Termine chaque journée par un <a class="link" href="#ritual">rituel de fin</a>.</li></ul></article>
     </div>`;
+}
+
+// --- Réglages ----------------------------------------------------------------------------
+function viewSettings() {
+  const c = S.config;
+  const row = (key, ico, title, desc) => `
+    <div class="toggle-row ${c[key] ? "on" : ""}">
+      <div class="ico">${icon(ico)}</div>
+      <div class="txt"><div class="title" id="t-${key}">${title}</div><div class="desc">${desc}</div></div>
+      <button class="switch" role="switch" data-setting="${key}" aria-labelledby="t-${key}" aria-checked="${!!c[key]}"></button>
+    </div>`;
+  return `
+    <header class="page-head"><h1>Réglages</h1>
+      <p>OpusFocus enregistre chaque changement tout de suite.</p></header>
+    <div class="stack">
+      <section class="card">
+        <span class="field-label">Démarrage</span>
+        ${row("launch_at_startup", "power", "Ouvrir OpusFocus au démarrage", "La fenêtre s'ouvre quand tu ouvres ta session Windows, prête pour ta première session.")}
+      </section>
+      <section class="card">
+        <span class="field-label">Musique focus</span>
+        ${row("music_autoplay", "music", "Lancer la musique avec la session", "La musique démarre au début de chaque session et s'arrête à la fin.")}
+        <div class="cta-row" style="margin-top:8px"><button class="btn small" data-music-open>${icon("folder")}Ouvrir le dossier de musique</button></div>
+      </section>
+      <section class="card">
+        <label class="field-label" for="phrase-setting">Phrase d'abandon</label>
+        <p class="helper" style="margin:0 0 12px">En mode engagement, c'est la phrase à recopier pour arrêter une session avant la fin.
+          Choisis-en une qui te fasse réfléchir. ${S.session?.lock ? "<strong>Elle se change après la session en cours.</strong>" : ""}</p>
+        <form class="add-row" id="phrase-form">
+          <input class="input" id="phrase-setting" maxlength="150" autocomplete="off" spellcheck="false"
+            value="${esc(S.abandon_phrase)}" ${S.session?.lock ? "disabled" : ""}>
+          <button class="btn" ${S.session?.lock ? "disabled" : ""}>${icon("check")}Enregistrer</button>
+        </form>
+        <p class="helper" style="margin:8px 0 0">Entre 10 et 150 caractères. Majuscules et espaces en trop ne comptent pas.</p>
+      </section>
+      <section class="card">
+        <span class="field-label">Blocage des sites web</span>
+        <p class="helper" style="margin:0 0 12px">${S.admin ? "Mode administrateur actif : les sites cochés sont bloqués pendant les sessions."
+          : "Windows demande les droits administrateur pour bloquer les sites. Les autres protections fonctionnent sans."}</p>
+        ${S.admin ? "" : `<button class="btn small primary" data-elevate>${icon("shield")}Activer le mode administrateur</button>`}
+      </section>
+    </div>`;
+}
+
+function bindSettings() {
+  $$("[data-setting]").forEach((b) => b.addEventListener("click", async () => {
+    const key = b.dataset.setting, v = !S.config[key];
+    b.setAttribute("aria-checked", v);
+    b.closest(".toggle-row").classList.toggle("on", v);
+    try {
+      S.config = (await api("/api/config", { [key]: v })).config;
+      toast("Enregistré");
+    } catch (e) {
+      toast(e.message, "error");
+      render();
+    }
+  }));
+  $("[data-music-open]")?.addEventListener("click", openMusicFolder);
+  $("[data-elevate]")?.addEventListener("click", elevate);
+  $("#phrase-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      S.config = (await api("/api/config", { abandon_phrase: $("#phrase-setting").value })).config;
+      await poll();
+      toast("Phrase d'abandon enregistrée");
+    } catch (err) { toast(err.message, "error"); }
+  });
 }
 
 // --- Musique focus --------------------------------------------------------------------

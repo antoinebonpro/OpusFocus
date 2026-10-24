@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="focus_blocker_service_label">OpusFocus — blocage</string>
+  <string name="focus_blocker_service_description">Pendant une session de concentration, ferme les applications que tu n\'as pas autorisées. Le service voit seulement quelle application s\'ouvre, jamais ce qu\'elle affiche, et rien ne quitte le téléphone.</string>
+</resources>

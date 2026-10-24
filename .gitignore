@@ -8,3 +8,6 @@ build/tmp/
 build/icon.ico
 .venv-build/
 Music/
+*.log
+mobile/modules/*/android/build/
+mobile/.claude/
