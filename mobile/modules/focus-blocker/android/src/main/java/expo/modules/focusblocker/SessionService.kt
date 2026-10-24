@@ -70,7 +70,8 @@ class BootReceiver : BroadcastReceiver() {
     } else {
       Session.complete(context, notify = store.endAt > 0)
     }
-    if (store.openAtBoot) Session.openApp(context)
+    // Une seule ouverture par démarrage réel : le récepteur est exporté, une diffusion imitée ne doit rien rouvrir.
+    Session.openAtBootOnce(context)
   }
 }
 

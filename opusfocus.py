@@ -1126,6 +1126,8 @@ def main():
         except OSError:
             server = None  # port pris entre-temps : on en prend un autre, la fenêtre sera remplacée
     if server is None:
+        # Le jeton ne suit que son port : sur un nouveau port, la fenêtre est remplacée de toute façon.
+        token = secrets.token_urlsafe(24)
         server = Server(("127.0.0.1", 0), make_handler(engine, token, port_ref))
     port_ref[0] = server.server_address[1]
     engine.url = f"http://127.0.0.1:{port_ref[0]}/"
