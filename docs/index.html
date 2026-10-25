@@ -8,44 +8,44 @@
 <meta property="og:title" content="OpusFocus — Une seule chose à la fois">
 <meta property="og:description" content="Bloqueur de distractions inspiré de Deep Work, pour Windows et Android.">
 <meta property="og:image" content="https://antoinebonpro.github.io/OpusFocus/img/icon.png">
-<meta name="theme-color" content="#0e1014">
+<meta name="theme-color" content="#0d1814">
 <link rel="icon" href="favicon.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400..800&display=swap" rel="stylesheet">
 <style>
   :root {
-    --bg: #0e1014;
-    --surface: #15181e;
-    --surface-2: #1c2028;
-    --border: rgba(255, 255, 255, 0.08);
-    --border-strong: rgba(255, 255, 255, 0.16);
-    --text: #ecebe7;
-    --muted: #a0a5b0;
-    --faint: #6f7480;
-    --accent: #e2b66b;
-    --accent-hover: #ecc584;
-    --on-accent: #1b1408;
-    --accent-soft: rgba(226, 182, 107, 0.12);
-    --success: #7dc49a;
+    --bg: #0d1814;
+    --surface: #15241d;
+    --surface-2: #1c2f26;
+    --border: rgba(245, 248, 240, 0.12);
+    --border-strong: rgba(245, 248, 240, 0.24);
+    --text: #f8f5ec;
+    --muted: #b3bdb2;
+    --faint: #92a097;
+    --accent: #22c870;
+    --accent-hover: #4ee79b;
+    --on-accent: #0d1814;
+    --accent-soft: rgba(34, 200, 112, 0.14);
+    --success: #4ee79b;
     --radius: 18px;
     --sans: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   }
   @media (prefers-color-scheme: light) {
     :root {
-      --bg: #f5f4f0;
-      --surface: #ffffff;
-      --surface-2: #efede7;
-      --border: rgba(20, 20, 20, 0.08);
-      --border-strong: rgba(20, 20, 20, 0.16);
-      --text: #1d1f24;
-      --muted: #5a5f6a;
-      --faint: #80848e;
-      --accent: #8f6118;
-      --accent-hover: #7a5214;
+      --bg: #f8f5ec;
+      --surface: #fffdf7;
+      --surface-2: #f1ebd9;
+      --border: rgba(13, 24, 20, 0.10);
+      --border-strong: rgba(13, 24, 20, 0.20);
+      --text: #0d1814;
+      --muted: #2c4a3d;
+      --faint: #5d7268;
+      --accent: #15904a;
+      --accent-hover: #0f7a3d;
       --on-accent: #ffffff;
-      --accent-soft: rgba(143, 97, 24, 0.10);
-      --success: #2f7a4f;
+      --accent-soft: rgba(21, 144, 74, 0.10);
+      --success: #15904a;
     }
   }
   * { box-sizing: border-box; }
@@ -111,12 +111,12 @@
   }
   .window {
     position: relative; border-radius: 12px; overflow: hidden;
-    background: #0a0b0e; border: 1px solid var(--border-strong);
+    background: #0a1410; border: 1px solid var(--border-strong);
     box-shadow: 0 40px 100px rgba(0,0,0,.35);
   }
   .window .bar {
     display: flex; align-items: center; justify-content: space-between;
-    height: 34px; padding: 0 0 0 14px; background: #1b1e25; color: #c9cbd1;
+    height: 34px; padding: 0 0 0 14px; background: #14221c; color: #d2dccd;
     font-size: 12px; font-weight: 500;
   }
   .window .bar span { display: flex; align-items: center; gap: 8px; }
@@ -125,7 +125,7 @@
   .window .ctrl i { width: 44px; display: grid; place-items: center; font-style: normal; opacity: .7; }
   .stage .phone {
     position: absolute; right: -28px; bottom: -40px; width: 22%;
-    border-radius: 28px; padding: 7px; background: #0a0b0e;
+    border-radius: 28px; padding: 7px; background: #0a1410;
     box-shadow: 0 30px 70px rgba(0,0,0,.5), 0 0 0 1px rgba(255,255,255,.08);
   }
   .stage .phone img { border-radius: 22px; }
