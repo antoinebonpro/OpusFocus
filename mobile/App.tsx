@@ -108,7 +108,7 @@ function Shell() {
 
   return (
     <View style={{ flex: 1, backgroundColor: c.bg, paddingTop: insets.top }}>
-      <StatusBar style={c.bg === "#0e1014" ? "light" : "dark"} />
+      <StatusBar style={c.bg === "#0d1814" ? "light" : "dark"} />
       <ToastProvider bottom={tabBarHeight + (showMini ? 66 : 12)}>
         <View style={{ flex: 1 }}>{content}</View>
         {showMini && <MiniPlayer onOpen={() => go("more", "music")} />}

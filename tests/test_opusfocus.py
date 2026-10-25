@@ -52,6 +52,8 @@ class Sandbox(unittest.TestCase):
             mock.patch.object(dw, "relaunch_as_admin", lambda: False),
             mock.patch.object(dw.winsound, "MessageBeep", lambda *a: None),
             mock.patch.object(dw, "is_admin", lambda: True),
+            mock.patch.object(dw, "helper_alive", lambda: False),
+            mock.patch.object(dw, "HELPER_REQUEST", TMP / "helper_request.json"),
             mock.patch.object(dw, "set_launch_at_startup", self._startup),
         ]
         for p in patches:
@@ -194,6 +196,31 @@ class TestEngine(Sandbox):
         self.start(e, sites=True)
         self.assertFalse(e.session["sites"])
         self.assertNotIn("youtube.com", self.hosts())
+
+    def test_sites_go_through_helper_without_admin(self):
+        # Service installé : l'app sans droits lui confie la liste, elle ne touche jamais hosts elle-même.
+        request = TMP / "helper_request.json"
+        with mock.patch.object(dw, "is_admin", lambda: False), mock.patch.object(dw, "helper_alive", lambda: True), \
+                mock.patch.object(dw, "request_sites", lambda sites, until: dw.save_json(request, {"sites": sites, "until": until})):
+            e = dw.Engine()
+            self.assertTrue(e.snapshot()["admin"])
+            self.assertTrue(e.snapshot()["sites_helper"])
+            self.start(e, sites=True)
+            self.assertTrue(e.session["sites"])
+            self.assertEqual(dw.load_json(request, {})["sites"], e.config["sites"])
+            self.assertEqual(dw.load_json(request, {})["until"], e.session["end"])
+            e.stop({})
+            self.assertEqual(dw.load_json(request, {}), {"sites": [], "until": 0})
+        self.assertNotIn("youtube.com", self.hosts())
+
+    def test_quit_refused_during_session(self):
+        e = dw.Engine()
+        with mock.patch.object(dw, "close_app_window", lambda: None), mock.patch.object(e, "show_window", lambda: None):
+            self.start(e)
+            self.assertFalse(e.quit())
+            self.assertIn("session", e.snapshot()["notice"])
+            e.stop({})
+            self.assertTrue(e.quit())
 
     def test_intention_truncated(self):
         e = dw.Engine()
@@ -839,3 +866,92 @@ class TestRename(unittest.TestCase):
                     dw.winreg.QueryValueEx(key, "OpusFocus")
         dw.winreg.DeleteKey(dw.winreg.HKEY_CURRENT_USER, test_key)
         dw.winreg.DeleteKey(dw.winreg.HKEY_CURRENT_USER, r"Software\OpusFocusTest")
+
+
+class TestSitesHelper(unittest.TestCase):
+    """Service SYSTEM : il ne fait confiance à rien de ce que contient le dossier partagé."""
+
+    def setUp(self):
+        self.req = TMP / "helper" / "sites.json"
+        self.req.parent.mkdir(exist_ok=True)
+        self.req.unlink(missing_ok=True)
+
+    def write(self, data):
+        self.req.write_text(json.dumps(data) if not isinstance(data, str) else data, encoding="utf-8")
+
+    def test_valid_request(self):
+        now = time.time()
+        self.write({"sites": ["YouTube.com", "x.com", "x.com"], "until": now + 600})
+        self.assertEqual(dw.read_site_request(self.req, now), ["x.com", "youtube.com"])
+
+    def test_invalid_or_expired_requests_unblock(self):
+        now = time.time()
+        for data in ({"sites": ["x.com"], "until": now - 1}, {"sites": ["x.com"], "until": now + 10 * 3600},
+                     {"sites": ["x.com"], "until": True}, {"sites": "x.com", "until": now + 60},
+                     {"sites": ["x.com"]}, [1, 2], "pas du json", {"sites": [], "until": 0}):
+            self.write(data)
+            self.assertEqual(dw.read_site_request(self.req, now), [], data)
+        self.req.unlink()
+        self.assertEqual(dw.read_site_request(self.req, now), [])
+
+    def test_request_cannot_inject_hosts_lines(self):
+        now = time.time()
+        self.write({"sites": ["ok.com", "evil.com\n6.6.6.6 bank.com", 42, None], "until": now + 60})
+        self.assertEqual(dw.read_site_request(self.req, now), ["ok.com"])
+
+    def test_oversized_and_hardlinked_requests_refused(self):
+        now = time.time()
+        self.write({"sites": ["x.com"] * 20000, "until": now + 60})
+        self.assertEqual(dw.read_site_request(self.req, now), [])
+        self.write({"sites": ["x.com"], "until": now + 60})
+        link = self.req.with_name("lien.json")
+        link.unlink(missing_ok=True)
+        os.link(self.req, link)
+        try:
+            self.assertEqual(dw.read_site_request(self.req, now), [])
+        finally:
+            link.unlink()
+
+    def test_helper_loop_applies_then_clears(self):
+        hosts = TMP / "hosts_helper"
+        hosts.write_text("127.0.0.1 localhost\n", encoding="utf-8")
+        stop = threading.Event()
+        name = f"Local\\OpusFocusTest{os.getpid()}"  # Global\ demande des droits que les tests n'ont pas
+        with mock.patch.object(dw, "HELPER_EVENT", name), mock.patch.object(dw, "flush_dns", lambda: None):
+            t = threading.Thread(target=dw.run_sites_helper, args=(self.req, hosts, stop), daemon=True)
+            t.start()
+            try:
+                self.assertTrue(self.wait(dw.helper_alive))
+                dw.request_sites(["youtube.com"], time.time() + 60, self.req)
+                self.assertTrue(self.wait(lambda: "0.0.0.0 youtube.com" in hosts.read_text(encoding="utf-8")))
+                dw.request_sites([], 0, self.req)
+                self.assertTrue(self.wait(lambda: "youtube.com" not in hosts.read_text(encoding="utf-8")))
+                self.assertIn("127.0.0.1 localhost", hosts.read_text(encoding="utf-8"))
+            finally:
+                stop.set()
+                t.join(5)
+            self.assertFalse(dw.helper_alive())
+
+    @staticmethod
+    def wait(cond, timeout=5.0):
+        end = time.time() + timeout
+        while time.time() < end:
+            if cond():
+                return True
+            time.sleep(0.1)
+        return False
+
+
+class TestTaskbar(unittest.TestCase):
+    def test_pinned_window_relaunches_opusfocus(self):
+        with mock.patch.object(dw, "FROZEN", True), mock.patch.object(dw.sys, "executable", r"C:\Apps\OpusFocus.exe"):
+            props = dw.window_properties()
+        self.assertEqual(props[2], r'"C:\Apps\OpusFocus.exe"')
+        self.assertEqual(props[3], r"C:\Apps\OpusFocus.exe,0")
+        self.assertEqual(props[5], "OpusFocus")
+        self.assertEqual(list(props)[-1], 5)  # l'identifiant en dernier
+
+    def test_tray_icon_starts_and_stops(self):
+        tray = dw.Tray(on_open=lambda: None, on_quit=lambda: None)
+        self.assertTrue(tray.start())
+        tray.stop()

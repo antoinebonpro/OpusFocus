@@ -7,10 +7,11 @@ Le moteur (ce fichier) applique les blocages et sert l'interface (dossier ui/) s
 Pendant une session :
   - coupe les notifications Windows (toasts),
   - ferme automatiquement les applications cochées,
-  - bloque les sites cochés via le fichier hosts (nécessite les droits admin).
+  - bloque les sites cochés via le fichier hosts : par le service installé une fois pour toutes
+    (`--sites-helper`, tâche planifiée SYSTEM), sinon directement en mode administrateur.
 
-Fermer la fenêtre n'arrête pas la session : le moteur continue en arrière-plan et
-rouvre la fenêtre à la fin. Après un plantage, tout est repris ou restauré au lancement.
+Fermer la fenêtre n'arrête rien : le moteur reste actif avec une icône près de l'horloge et
+rouvre la fenêtre à la fin d'une session. Après un plantage, tout est repris ou restauré au lancement.
 """
 
 import ctypes
@@ -467,6 +468,310 @@ def focus_window() -> bool:
     return True
 
 
+# --- Service de blocage des sites ------------------------------------------------
+# Installé une fois par l'installateur (tâche planifiée qui tourne en SYSTEM) : l'application,
+# lancée sans droits, lui confie les sites à bloquer et l'heure de fin ; lui seul écrit dans hosts.
+# Il ne lit qu'une liste de domaines revalidés et n'écrit que le bloc OpusFocus : rien d'autre à détourner.
+HELPER_DIR = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / APP_NAME
+HELPER_REQUEST = HELPER_DIR / "sites.json"
+HELPER_EVENT = "Global\\OpusFocusSites"  # existe tant que le service tourne
+HELPER_MAX_BYTES = 64 * 1024
+HELPER_MAX_SITES = 500
+HELPER_MAX_SECONDS = 9 * 3600  # une session dure au plus 8 h : une demande plus longue est refusée
+SYNCHRONIZE = 0x00100000
+
+_kernel32.OpenEventW.restype = ctypes.c_void_p
+_kernel32.OpenEventW.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_wchar_p]
+_kernel32.CreateEventW.restype = ctypes.c_void_p
+_kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool, ctypes.c_wchar_p]
+_kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+_advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+_advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+    ctypes.c_wchar_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+
+
+class _SecurityAttributes(ctypes.Structure):
+    _fields_ = [("nLength", ctypes.c_ulong), ("lpSecurityDescriptor", ctypes.c_void_p), ("bInheritHandle", ctypes.c_bool)]
+
+
+def helper_alive() -> bool:
+    handle = _kernel32.OpenEventW(SYNCHRONIZE, False, HELPER_EVENT)
+    if handle:
+        _kernel32.CloseHandle(handle)
+    return bool(handle)
+
+
+def request_sites(sites: list[str], until: float, path: Path = HELPER_REQUEST) -> None:
+    """Demande au service de bloquer ces sites jusqu'à until (liste vide : tout débloquer)."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"sites": sites, "until": until}), encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_site_request(path: Path = HELPER_REQUEST, now: float | None = None) -> list[str]:
+    """Sites que le service doit bloquer ; [] si la demande est absente, invalide ou expirée.
+    Le dossier est modifiable par l'utilisateur : on refuse liens et fichiers démesurés."""
+    now = time.time() if now is None else now
+    try:
+        st = os.lstat(path)
+        if st.st_file_attributes & 0x400 or st.st_nlink > 1 or st.st_size > HELPER_MAX_BYTES:  # point d'analyse
+            return []
+        data = json.loads(path.read_bytes()[:HELPER_MAX_BYTES])
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or not isinstance(data.get("sites"), list):
+        return []
+    until = data.get("until")
+    if isinstance(until, bool) or not isinstance(until, (int, float)) or not now < until <= now + HELPER_MAX_SECONDS:
+        return []
+    return sorted({d for d in (clean_domain(s) for s in data["sites"][:HELPER_MAX_SITES] if isinstance(s, str)) if d})
+
+
+def run_sites_helper(path: Path = HELPER_REQUEST, hosts: Path = HOSTS_FILE,
+                     stop: threading.Event | None = None) -> None:
+    """Boucle du service : aligne le fichier hosts sur la demande de l'application."""
+    sd = ctypes.c_void_p()
+    # Tout le monde peut seulement attendre l'événement (pour savoir que le service tourne) ; SYSTEM a tout.
+    if not _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            "D:(A;;0x00100000;;;WD)(A;;GA;;;SY)", 1, ctypes.byref(sd), None):
+        return
+    sa = _SecurityAttributes(ctypes.sizeof(_SecurityAttributes), sd, False)
+    event = _kernel32.CreateEventW(ctypes.byref(sa), True, False, HELPER_EVENT)
+    already = ctypes.get_last_error() == 183
+    _kernel32.LocalFree(sd)
+    if not event or already:  # déjà lancé
+        return
+    applied = None
+    while not (stop and stop.is_set()):
+        wanted = read_site_request(path)
+        if wanted != applied:
+            try:
+                block_sites(wanted, hosts) if wanted else unblock_sites(hosts)
+                applied = wanted
+            except OSError:
+                log_error()
+        time.sleep(1)
+    _kernel32.CloseHandle(event)
+
+
+def apply_site_block(sites: list[str], until: float) -> None:
+    if helper_alive():
+        request_sites(sites, until)
+    else:
+        block_sites(sites)
+
+
+def remove_site_block() -> None:
+    if helper_alive():
+        request_sites([], 0)
+    else:
+        unblock_sites()
+
+
+# --- Barre des tâches et zone de notification -------------------------------------
+def launch_command() -> str:
+    return startup_command().removesuffix(" --startup")
+
+
+class _GUID(ctypes.Structure):
+    _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort), ("Data3", ctypes.c_ushort),
+                ("Data4", ctypes.c_ubyte * 8)]
+
+    @classmethod
+    def parse(cls, text: str):
+        h = text.replace("-", "")
+        return cls(int(h[:8], 16), int(h[8:12], 16), int(h[12:16], 16),
+                   (ctypes.c_ubyte * 8)(*bytes.fromhex(h[16:])))
+
+
+class _PropertyKey(ctypes.Structure):
+    _fields_ = [("fmtid", _GUID), ("pid", ctypes.c_ulong)]
+
+
+class _PropVariant(ctypes.Structure):
+    _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort), ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                ("value", ctypes.c_void_p), ("pad", ctypes.c_void_p)]
+
+
+_shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+_shell32.SHGetPropertyStoreForWindow.argtypes = [ctypes.c_void_p, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+_IID_PROPERTY_STORE = _GUID.parse("886d8eeb-8cf2-4446-8d02-cdba1dbdcf99")
+_AUMID_FMTID = "9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"
+_STORE_SET = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(_PropertyKey), ctypes.POINTER(_PropVariant))
+_STORE_CALL = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
+
+
+def window_properties() -> dict:
+    """Identité de la fenêtre pour la barre des tâches : épinglée, elle relance OpusFocus et non le navigateur."""
+    icon = sys.executable if FROZEN else ROOT / "build" / "icon.ico"
+    return {2: launch_command(),  # RelaunchCommand
+            3: f"{icon},0",       # RelaunchIconResource
+            4: APP_NAME,          # RelaunchDisplayNameResource
+            5: APP_NAME}          # AppUserModel.ID, en dernier : il active les trois autres
+
+
+def tag_window(hwnd) -> bool:
+    store = ctypes.c_void_p()
+    if _shell32.SHGetPropertyStoreForWindow(hwnd, ctypes.byref(_IID_PROPERTY_STORE), ctypes.byref(store)) != 0:
+        return False
+    vtable = ctypes.cast(ctypes.cast(store, ctypes.POINTER(ctypes.c_void_p))[0], ctypes.POINTER(ctypes.c_void_p))
+    set_value, commit, release = _STORE_SET(vtable[6]), _STORE_CALL(vtable[7]), _STORE_CALL(vtable[2])
+    try:
+        for pid, text in window_properties().items():
+            buf = ctypes.create_unicode_buffer(text)
+            value = _PropVariant(31, 0, 0, 0, ctypes.cast(buf, ctypes.c_void_p), None)  # VT_LPWSTR
+            if set_value(store, ctypes.byref(_PropertyKey(_GUID.parse(_AUMID_FMTID), pid)), ctypes.byref(value)) != 0:
+                return False
+        return commit(store) == 0
+    finally:
+        release(store)
+
+
+class _NotifyIconData(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_ulong), ("hWnd", ctypes.c_void_p), ("uID", ctypes.c_uint),
+                ("uFlags", ctypes.c_uint), ("uCallbackMessage", ctypes.c_uint), ("hIcon", ctypes.c_void_p),
+                ("szTip", ctypes.c_wchar * 128), ("dwState", ctypes.c_ulong), ("dwStateMask", ctypes.c_ulong),
+                ("szInfo", ctypes.c_wchar * 256), ("uVersion", ctypes.c_uint), ("szInfoTitle", ctypes.c_wchar * 64),
+                ("dwInfoFlags", ctypes.c_ulong), ("guidItem", _GUID), ("hBalloonIcon", ctypes.c_void_p)]
+
+
+_WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t)
+
+
+class _WndClass(ctypes.Structure):
+    _fields_ = [("style", ctypes.c_uint), ("lpfnWndProc", _WNDPROC), ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int), ("hInstance", ctypes.c_void_p), ("hIcon", ctypes.c_void_p),
+                ("hCursor", ctypes.c_void_p), ("hbrBackground", ctypes.c_void_p), ("lpszMenuName", ctypes.c_wchar_p),
+                ("lpszClassName", ctypes.c_wchar_p)]
+
+
+class _Point(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+_user32.DefWindowProcW.restype = ctypes.c_ssize_t
+_user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+_user32.RegisterClassW.argtypes = [ctypes.POINTER(_WndClass)]
+_user32.CreateWindowExW.restype = ctypes.c_void_p
+_user32.CreateWindowExW.argtypes = [ctypes.c_ulong, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_int,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                    ctypes.c_void_p, ctypes.c_void_p]
+_user32.DestroyWindow.argtypes = [ctypes.c_void_p]
+_user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_ssize_t]
+_user32.GetMessageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+_user32.TranslateMessage.argtypes = _user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
+_user32.CreatePopupMenu.restype = ctypes.c_void_p
+_user32.AppendMenuW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_wchar_p]
+_user32.TrackPopupMenu.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_void_p, ctypes.c_void_p]
+_user32.DestroyMenu.argtypes = [ctypes.c_void_p]
+_user32.GetCursorPos.argtypes = [ctypes.POINTER(_Point)]
+_user32.LoadImageW.restype = _user32.LoadIconW.restype = ctypes.c_void_p
+_user32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+_user32.LoadIconW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+_user32.RegisterWindowMessageW.argtypes = [ctypes.c_wchar_p]
+_shell32.Shell_NotifyIconW.argtypes = [ctypes.c_ulong, ctypes.POINTER(_NotifyIconData)]
+_shell32.ExtractIconExW.argtypes = [ctypes.c_wchar_p, ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+                                    ctypes.c_uint]
+_kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+_kernel32.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+
+
+class Tray:
+    """Icône près de l'horloge : OpusFocus reste actif quand la fenêtre est fermée."""
+    WM_TRAY, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP = 0x0401, 0x0010, 0x0002, 0x0202, 0x0205
+    OPEN, QUIT = 1, 2
+
+    def __init__(self, on_open, on_quit):
+        self.on_open, self.on_quit = on_open, on_quit
+        self.hwnd = self.icon = self.taskbar_created = None
+        self.ready = threading.Event()
+        self._proc = _WNDPROC(self._wndproc)  # gardé en vie : Windows l'appelle jusqu'à la fin
+
+    def start(self) -> bool:
+        threading.Thread(target=self._run, daemon=True).start()
+        return self.ready.wait(5) and bool(self.hwnd)
+
+    def stop(self):
+        if self.hwnd:
+            _user32.PostMessageW(self.hwnd, self.WM_CLOSE, 0, 0)
+
+    def _load_icon(self):
+        if FROZEN:
+            small = ctypes.c_void_p()
+            if _shell32.ExtractIconExW(sys.executable, 0, None, ctypes.byref(small), 1) and small.value:
+                return small.value
+        else:
+            icon = _user32.LoadImageW(None, str(ROOT / "build" / "icon.ico"), 1, 16, 16, 0x10)  # LR_LOADFROMFILE
+            if icon:
+                return icon
+        return _user32.LoadIconW(None, ctypes.c_void_p(32512))  # IDI_APPLICATION
+
+    def _data(self) -> _NotifyIconData:
+        nid = _NotifyIconData(cbSize=ctypes.sizeof(_NotifyIconData), hWnd=self.hwnd, uID=1,
+                              uFlags=0x1 | 0x2 | 0x4, uCallbackMessage=self.WM_TRAY, hIcon=self.icon)
+        nid.szTip = f"{APP_NAME} — une seule chose à la fois"
+        return nid
+
+    def _run(self):
+        try:
+            hinst = _kernel32.GetModuleHandleW(None)
+            wc = _WndClass(lpfnWndProc=self._proc, hInstance=hinst, lpszClassName="OpusFocusTray")
+            _user32.RegisterClassW(ctypes.byref(wc))
+            # Fenêtre jamais affichée (pas « message-only » : elle doit recevoir TaskbarCreated).
+            self.hwnd = _user32.CreateWindowExW(0, "OpusFocusTray", APP_NAME, 0, 0, 0, 0, 0, None, None, hinst, None)
+            self.taskbar_created = _user32.RegisterWindowMessageW("TaskbarCreated")
+            self.icon = self._load_icon()
+            if self.hwnd and not _shell32.Shell_NotifyIconW(0, ctypes.byref(self._data())):  # NIM_ADD
+                _user32.DestroyWindow(self.hwnd)
+                self.hwnd = None
+        finally:
+            self.ready.set()
+        if not self.hwnd:
+            return
+        msg = ctypes.create_string_buffer(64)
+        while _user32.GetMessageW(msg, None, 0, 0) > 0:
+            _user32.TranslateMessage(msg)
+            _user32.DispatchMessageW(msg)
+
+    def _menu(self) -> int:
+        menu = _user32.CreatePopupMenu()
+        _user32.AppendMenuW(menu, 0, self.OPEN, f"Ouvrir {APP_NAME}")
+        _user32.AppendMenuW(menu, 0x800, 0, None)  # séparateur
+        _user32.AppendMenuW(menu, 0, self.QUIT, "Quitter")
+        pt = _Point()
+        _user32.GetCursorPos(ctypes.byref(pt))
+        _user32.SetForegroundWindow(self.hwnd)  # sinon le menu ne se ferme pas quand on clique ailleurs
+        choice = _user32.TrackPopupMenu(menu, 0x0100 | 0x0020, pt.x, pt.y, 0, self.hwnd, None)  # RETURNCMD|BOTTOMALIGN
+        _user32.DestroyMenu(menu)
+        return choice
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        try:
+            if msg == self.WM_TRAY:
+                action = None
+                if lparam == self.WM_LBUTTONUP:
+                    action = self.on_open
+                elif lparam == self.WM_RBUTTONUP:
+                    action = {self.OPEN: self.on_open, self.QUIT: self.on_quit}.get(self._menu())
+                if action:
+                    threading.Thread(target=action, daemon=True).start()
+                return 0
+            if msg == self.taskbar_created:  # l'Explorateur a redémarré : on remet l'icône
+                _shell32.Shell_NotifyIconW(0, ctypes.byref(self._data()))
+                return 0
+            if msg == self.WM_CLOSE:
+                _shell32.Shell_NotifyIconW(2, ctypes.byref(self._data()))  # NIM_DELETE
+                _user32.DestroyWindow(hwnd)
+                return 0
+            if msg == self.WM_DESTROY:
+                _user32.PostQuitMessage(0)
+                return 0
+        except Exception:  # noqa: BLE001 — une exception ne doit pas traverser la frontière avec Windows
+            log_error()
+        return _user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
 def running_processes() -> set[str]:
     return {name for _, name in list_processes()}
 
@@ -633,16 +938,20 @@ class Engine:
         self.ui_seen = False  # une fenêtre a interrogé ce moteur depuis son démarrage
         self._recover()
 
+    def can_block_sites(self) -> bool:
+        """Les sites se bloquent par le service installé, ou directement si l'app tourne en administrateur."""
+        return helper_alive() or self.admin
+
     # ----- Cycle de vie
     def _recover(self):
         st = load_json(STATE_FILE, None)
         if not st or not st.get("active"):
             return
         if st["end"] > time.time():
-            if st.get("sites") and not self.admin:
+            if st.get("sites") and not self.can_block_sites():
                 st["sites"] = False
                 try:
-                    unblock_sites()
+                    remove_site_block()
                 except OSError:
                     pass
             self.session = st
@@ -669,7 +978,8 @@ class Engine:
             if st and time.time() >= st["end"]:
                 self._finish(completed=True)
                 return False
-            idle = not st and not self.review_id and time.time() - self.last_seen > IDLE_EXIT_SECONDS
+            # Avec l'icône près de l'horloge, le moteur reste actif : on ne surveille l'inactivité que sans elle.
+            idle = bool(self.on_idle) and not st and not self.review_id and time.time() - self.last_seen > IDLE_EXIT_SECONDS
         if idle and find_app_window():
             # Fenêtre réduite ou en arrière-plan : le navigateur ralentit ses appels, mais elle est toujours là.
             self.last_seen, idle = time.time(), False
@@ -698,6 +1008,7 @@ class Engine:
             while time.time() < end:
                 if self.ui_seen:
                     focus_window()
+                    self._tag_new_window()
                     return
                 time.sleep(0.25)
             close_app_window()
@@ -718,7 +1029,7 @@ class Engine:
         save_json(STATE_FILE, st)  # écrit avant le hosts, pour pouvoir tout restaurer après un plantage
         if st["sites"]:
             try:
-                block_sites(self.config["sites"])
+                apply_site_block(self.config["sites"], st["end"])
             except OSError as e:
                 st["sites"] = False
                 errors.append(f"Sites : {e}")
@@ -730,7 +1041,7 @@ class Engine:
             notifications_restore(st["notif_prev"])
         if st.get("sites"):
             try:
-                unblock_sites()
+                remove_site_block()
             except OSError:
                 return
         try:
@@ -768,6 +1079,31 @@ class Engine:
                 return  # une fenêtre est déjà en train de s'ouvrir
             self.window_opened_at = time.time()
         open_window(self.url)
+        threading.Thread(target=self._tag_new_window, daemon=True).start()
+
+    def _tag_new_window(self):
+        """Donne à la fenêtre l'identité d'OpusFocus dans la barre des tâches, dès qu'elle apparaît."""
+        end = time.time() + 15
+        while time.time() < end:
+            hwnd = find_app_window()
+            if hwnd:
+                tag_window(hwnd)
+                return
+            time.sleep(0.3)
+
+    def quit(self) -> bool:
+        """Quitter depuis l'icône : refusé pendant une session (le blocage doit tenir jusqu'à la fin)."""
+        with self.lock:
+            if self.session:
+                self.notice = "Une session est en cours : OpusFocus reste actif jusqu'à la fin."
+                busy = True
+            else:
+                busy = False
+        if busy:
+            self.show_window()
+            return False
+        close_app_window()
+        return True
 
     # ----- Actions de l'interface
     def snapshot(self) -> dict:
@@ -782,7 +1118,8 @@ class Engine:
                             "blocked_count", "last_killed")}
             review = next((s for s in self.sessions if s["id"] == self.review_id), None) if self.review_id else None
             return {
-                "now": time.time(), "admin": self.admin, "config": self.config, "session": session,
+                "now": time.time(), "admin": self.can_block_sites(), "sites_helper": helper_alive(),
+                "config": self.config, "session": session,
                 "review": review, "sessions": self.sessions, "notice": notice,
                 "today": dt.date.today().isoformat(), "abandon_phrase": self.abandon_phrase(),
             }
@@ -809,7 +1146,7 @@ class Engine:
                 "id": secrets.token_hex(6), "active": True, "start": now, "end": now + minutes * 60,
                 "planned_min": minutes, "intention": intention[:200],
                 "notif": bool(data.get("notif")), "apps": bool(data.get("apps")),
-                "sites": bool(data.get("sites")) and self.admin, "lock": bool(data.get("lock")),
+                "sites": bool(data.get("sites")) and self.can_block_sites(), "lock": bool(data.get("lock")),
                 "notif_prev": {}, "blocked_count": 0, "last_killed": None,
                 "phrase": self.abandon_phrase(),
             }
@@ -857,7 +1194,7 @@ class Engine:
                     raise ApiError("Mode engagement : tu peux ajouter des blocages, pas en retirer.")
                 cfg["sites"] = sites
                 if st and st["sites"]:
-                    block_sites(sites)
+                    apply_site_block(sites, st["end"])
             if "music_autoplay" in data:
                 cfg["music_autoplay"] = bool(data["music_autoplay"])
             if "abandon_phrase" in data:
@@ -1080,6 +1417,16 @@ def show_existing_instance(timeout: float = 15.0) -> None:
 
 
 def main():
+    if "--sites-helper" in sys.argv:
+        # Lancé en SYSTEM par la tâche planifiée de l'installateur : pas de fenêtre, pas de données utilisateur.
+        run_sites_helper()
+        return
+    if "--sites-cleanup" in sys.argv:  # désinstallation : aucun site ne doit rester bloqué
+        try:
+            unblock_sites()
+        except OSError:
+            log_error()
+        return
     migrate_legacy_data()
     APP_DIR.mkdir(parents=True, exist_ok=True)
     replace = "--replace" in sys.argv
@@ -1134,12 +1481,20 @@ def main():
     save_json(SERVER_FILE, {"port": port_ref[0], "token": token, "pid": os.getpid()})
     save_json(ENDPOINT_FILE, {"port": port_ref[0], "token": token})
 
-    engine.on_idle = lambda: threading.Thread(target=server.shutdown, daemon=True).start()
+    def shutdown():
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    tray = Tray(on_open=engine.show_window, on_quit=lambda: engine.quit() and shutdown())
+    if not tray.start():
+        engine.on_idle = shutdown  # sans icône, on ne garderait qu'un processus invisible : il s'arrête seul
     threading.Thread(target=engine.run_forever, daemon=True).start()
-    threading.Thread(target=engine.ensure_window, daemon=True).start()
+    # À l'ouverture de session, OpusFocus démarre discrètement près de l'horloge (sauf session à reprendre).
+    if "--startup" not in sys.argv or engine.session or not tray.hwnd:
+        threading.Thread(target=engine.ensure_window, daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
+        tray.stop()
         server.server_close()
         with engine.lock:
             current = load_json(SERVER_FILE, {})

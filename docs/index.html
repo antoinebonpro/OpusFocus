@@ -250,7 +250,7 @@
           Aussi sur Android
         </a>
       </div>
-      <p class="meta">Version 1.0.0 · Windows 10 et 11 · Aucun compte, aucune donnée envoyée</p>
+      <p class="meta">Version 1.1.0 · Windows 10 et 11 · Aucun compte, aucune donnée envoyée</p>
     </div>
     <div class="stage">
       <div class="window">
@@ -336,7 +336,7 @@
           <tbody>
             <tr><td>Notifications</td><td>Notifications Windows coupées, puis restaurées</td><td>« Ne pas déranger », puis retour au réglage d'avant</td></tr>
             <tr><td>Applications</td><td>Les applications cochées sont fermées dès qu'elles s'ouvrent</td><td>L'application bloquée est remplacée par l'écran « Reste concentré »</td></tr>
-            <tr><td>Sites</td><td>Redirection via le fichier <code>hosts</code> (mode administrateur)</td><td>VPN local qui ne filtre que le DNS, sans rien envoyer ailleurs</td></tr>
+            <tr><td>Sites</td><td>Redirection via le fichier <code>hosts</code>, par un petit service installé une fois</td><td>VPN local qui ne filtre que le DNS, sans rien envoyer ailleurs</td></tr>
             <tr><td>Fin à l'heure</td><td>Moteur en arrière-plan, la fenêtre revient pour le bilan</td><td>Compte à rebours en notification, reprise après redémarrage</td></tr>
           </tbody>
         </table>
@@ -375,9 +375,10 @@
           <ol>
             <li>Télécharge et lance <code>OpusFocus-Setup.exe</code>.</li>
             <li>Si Windows SmartScreen s'affiche : « Informations complémentaires » puis « Exécuter quand même ».</li>
-            <li>L'installation ne demande pas de droits administrateur. OpusFocus s'ouvre à chaque démarrage (réglable).</li>
+            <li>Accepte une fois les droits administrateur : ils servent à installer le service qui bloque les sites. Ensuite, plus aucune demande.</li>
+            <li>Épingle OpusFocus à la barre des tâches. Il reste aussi près de l'horloge et se lance au démarrage (réglable).</li>
           </ol>
-          <p class="note"><strong>Bloquer les sites</strong> demande le mode administrateur, activable depuis Réglages. Les autres protections fonctionnent sans.</p>
+          <p class="note"><strong>Bloquer les sites</strong> fonctionne sans rien accepter à chaque session : l'app tourne sans droits et confie la liste au service.</p>
           <div class="actions">
             <a class="btn primary" href="https://github.com/antoinebonpro/OpusFocus/releases/latest/download/OpusFocus-Setup.exe">Installateur (.exe)</a>
             <a class="btn" href="https://github.com/antoinebonpro/OpusFocus/releases/latest/download/OpusFocus.exe">Version portable · 7,7 Mo</a>

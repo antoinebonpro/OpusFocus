@@ -140,7 +140,7 @@ async function poll() {
     if (prev?.session && !S.session) onSessionEnd();
     if (!prev || key !== lastSessionKey || adminChanged) {
       lastSessionKey = key;
-      if (adminChanged && S.admin) { draft.sites = true; toast("Mode administrateur actif : les sites peuvent être bloqués."); }
+      if (adminChanged && S.admin) { draft.sites = true; toast("Blocage des sites disponible."); }
       renderNav();
       render();
     } else {
@@ -945,8 +945,9 @@ function viewSettings() {
       </section>
       <section class="card">
         <span class="field-label">Blocage des sites web</span>
-        <p class="helper" style="margin:0 0 12px">${S.admin ? "Mode administrateur actif : les sites cochés sont bloqués pendant les sessions."
-          : "Windows demande les droits administrateur pour bloquer les sites. Les autres protections fonctionnent sans."}</p>
+        <p class="helper" style="margin:0 0 12px">${S.sites_helper ? "Service de blocage installé : les sites cochés sont bloqués pendant les sessions, sans rien demander."
+          : S.admin ? "Mode administrateur actif : les sites cochés sont bloqués pendant les sessions."
+          : "Windows demande les droits administrateur pour bloquer les sites. Réinstalle OpusFocus pour ne plus avoir à les donner, ou active-les pour cette fois."}</p>
         ${S.admin ? "" : `<button class="btn small primary" data-elevate>${icon("shield")}Activer le mode administrateur</button>`}
       </section>
     </div>`;
