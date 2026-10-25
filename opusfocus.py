@@ -479,6 +479,13 @@ HELPER_MAX_BYTES = 64 * 1024
 HELPER_MAX_SITES = 500
 HELPER_MAX_SECONDS = 9 * 3600  # une session dure au plus 8 h : une demande plus longue est refusée
 SYNCHRONIZE = 0x00100000
+# La demande peut venir de n'importe quel programme : le service ne bloque jamais les mises à jour de Windows,
+# la vérification des certificats ni celles des antivirus (un logiciel malveillant ne doit pas pouvoir s'en servir).
+HELPER_NEVER_BLOCK = ("microsoft.com", "windowsupdate.com", "windows.com", "windows.net", "msftconnecttest.com",
+                      "msftncsi.com", "digicert.com", "verisign.com", "globalsign.com", "letsencrypt.org",
+                      "avast.com", "avg.com", "bitdefender.com", "bitdefender.net", "kaspersky.com", "eset.com",
+                      "mcafee.com", "norton.com", "malwarebytes.com", "sophos.com", "trendmicro.com",
+                      "crowdstrike.com", "sentinelone.net", "f-secure.com", "withsecure.com")
 
 _kernel32.OpenEventW.restype = ctypes.c_void_p
 _kernel32.OpenEventW.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_wchar_p]
@@ -517,14 +524,15 @@ def read_site_request(path: Path = HELPER_REQUEST, now: float | None = None) -> 
         if st.st_file_attributes & 0x400 or st.st_nlink > 1 or st.st_size > HELPER_MAX_BYTES:  # point d'analyse
             return []
         data = json.loads(path.read_bytes()[:HELPER_MAX_BYTES])
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # RecursionError : JSON imbriqué à l'extrême
         return []
     if not isinstance(data, dict) or not isinstance(data.get("sites"), list):
         return []
     until = data.get("until")
     if isinstance(until, bool) or not isinstance(until, (int, float)) or not now < until <= now + HELPER_MAX_SECONDS:
         return []
-    return sorted({d for d in (clean_domain(s) for s in data["sites"][:HELPER_MAX_SITES] if isinstance(s, str)) if d})
+    sites = {clean_domain(s) for s in data["sites"][:HELPER_MAX_SITES] if isinstance(s, str)}
+    return sorted(d for d in sites if d and not any(d == n or d.endswith("." + n) for n in HELPER_NEVER_BLOCK))
 
 
 def run_sites_helper(path: Path = HELPER_REQUEST, hosts: Path = HOSTS_FILE,
@@ -543,13 +551,13 @@ def run_sites_helper(path: Path = HELPER_REQUEST, hosts: Path = HOSTS_FILE,
         return
     applied = None
     while not (stop and stop.is_set()):
-        wanted = read_site_request(path)
-        if wanted != applied:
-            try:
+        try:
+            wanted = read_site_request(path)
+            if wanted != applied:
                 block_sites(wanted, hosts) if wanted else unblock_sites(hosts)
                 applied = wanted
-            except OSError:
-                log_error()
+        except Exception:  # noqa: BLE001 — rien de ce que contient la demande ne doit arrêter le service
+            log_error()
         time.sleep(1)
     _kernel32.CloseHandle(event)
 

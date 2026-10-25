@@ -899,6 +899,16 @@ class TestSitesHelper(unittest.TestCase):
         self.write({"sites": ["ok.com", "evil.com\n6.6.6.6 bank.com", 42, None], "until": now + 60})
         self.assertEqual(dw.read_site_request(self.req, now), ["ok.com"])
 
+    def test_critical_domains_never_blocked(self):
+        now = time.time()
+        self.write({"sites": ["youtube.com", "microsoft.com", "update.microsoft.com", "windowsupdate.com",
+                              "eset.com", "notmicrosoft.com"], "until": now + 60})
+        self.assertEqual(dw.read_site_request(self.req, now), ["notmicrosoft.com", "youtube.com"])
+
+    def test_deeply_nested_request_does_not_crash(self):
+        self.write("[" * 30000 + "]" * 30000)  # sous la limite de taille : c'est bien le parseur qui est testé
+        self.assertEqual(dw.read_site_request(self.req, time.time()), [])
+
     def test_oversized_and_hardlinked_requests_refused(self):
         now = time.time()
         self.write({"sites": ["x.com"] * 20000, "until": now + 60})
