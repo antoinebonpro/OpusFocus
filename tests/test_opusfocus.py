@@ -363,6 +363,103 @@ class TestEngine(Sandbox):
         self.assertIsNone(e.session)
 
 
+# --- Plages horaires -----------------------------------------------------------------------
+class TestSchedule(Sandbox):
+    def slot(self, **kw):
+        raw = {"id": "a1b2c3d4", "days": [0, 1, 2, 3, 4], "start": "09:00", "minutes": 90,
+               "intention": "Écrire le chapitre 2", "notif": True, "apps": True, "sites": True, "lock": False}
+        raw.update(kw)
+        return dw.clean_slot(raw)
+
+    def at(self, hh, mm, day=12):
+        return dw.dt.datetime(2026, 11, day, hh, mm)  # le 12 novembre 2026 est un jeudi
+
+    def tick_at(self, engine, when):
+        with mock.patch.object(dw.dt, "datetime", wraps=dw.dt.datetime) as fake:
+            fake.now.return_value = when
+            engine._tick()
+
+    def test_clean_slot_validation(self):
+        for bad in [{"start": "9:00"}, {"start": "24:00"}, {"start": "12:60"}, {"minutes": 4}, {"minutes": 481},
+                    {"days": []}, {"days": [7]}, {"days": "lundi"}, {"days": [True]}, {"minutes": "x"}]:
+            with self.subTest(bad=bad):
+                with self.assertRaises(dw.ApiError):
+                    self.slot(**bad)
+        with self.assertRaises(dw.ApiError):
+            dw.clean_slot("pas un dict")
+        s = self.slot(id="<script>", intention="   ", days=[4, 0, 4])
+        self.assertRegex(s["id"], r"^[0-9a-f]{8}$")
+        self.assertEqual(s["intention"], "Bloc de deep work planifié")
+        self.assertEqual(s["days"], [0, 4])
+
+    def test_due_slot_window(self):
+        s = self.slot()
+        self.assertIsNone(dw.due_slot([s], {}, self.at(8, 59)))
+        self.assertEqual(dw.due_slot([s], {}, self.at(9, 0)), (s, 90))
+        self.assertEqual(dw.due_slot([s], {}, self.at(10, 0))[1], 30)
+        self.assertIsNone(dw.due_slot([s], {}, self.at(10, 27)), "moins de 5 minutes restantes")
+        self.assertIsNone(dw.due_slot([s], {}, self.at(9, 30, day=15)), "dimanche non coché")
+        self.assertIsNone(dw.due_slot([s], {s["id"]: "2026-11-12"}, self.at(9, 30)), "déjà faite aujourd'hui")
+        self.assertIsNotNone(dw.due_slot([s], {s["id"]: "2026-11-11"}, self.at(9, 30)))
+        self.assertIsNone(dw.due_slot([self.slot(enabled=False)], {}, self.at(9, 30)))
+
+    def test_next_slot(self):
+        a, b = self.slot(), self.slot(id="b1b2c3d4", start="14:00", days=[0])
+        n = dw.next_slot([a, b], {}, self.at(8, 0))
+        self.assertEqual((n["id"], n["at"]), (a["id"], self.at(9, 0).timestamp()))
+        n = dw.next_slot([a, b], {a["id"]: "2026-11-12"}, self.at(9, 30))  # faite : demain vendredi 9 h
+        self.assertEqual(n["at"], self.at(9, 0, day=13).timestamp())
+        n = dw.next_slot([b], {}, self.at(15, 0))  # lundi suivant
+        self.assertEqual(n["at"], self.at(14, 0, day=16).timestamp())
+        self.assertIsNone(dw.next_slot([], {}, self.at(9, 0)))
+
+    def test_engine_starts_scheduled_session(self):
+        e = dw.Engine()
+        e.update_config({"schedule": [self.slot(start="09:00", minutes=60, lock=True)]})
+        self.tick_at(e, self.at(9, 20))
+        self.assertIsNotNone(e.session)
+        self.assertTrue(e.session["scheduled"])
+        self.assertTrue(e.session["lock"])
+        self.assertEqual(e.session["planned_min"], 40)
+        self.assertEqual(e.session["intention"], "Écrire le chapitre 2")
+        self.assertIn("youtube.com", self.hosts())
+        self.assertIn("09:00", e.notice)
+        self.assertEqual(dw.load_config()["schedule_done"], {"a1b2c3d4": "2026-11-12"})
+        e.stop({"phrase": e.abandon_phrase()})
+        self.tick_at(e, self.at(9, 25))
+        self.assertIsNone(e.session, "une plage abandonnée ne redémarre pas")
+
+    def test_slot_during_manual_session_is_consumed(self):
+        e = dw.Engine()
+        e.start({"intention": "Manuel", "minutes": 120})
+        e.update_config({"schedule": [self.slot()]})
+        self.tick_at(e, self.at(9, 5))
+        self.assertEqual(e.session["intention"], "Manuel")
+        self.assertIn("a1b2c3d4", e.config["schedule_done"])
+
+    def test_skip_and_replace_schedule(self):
+        e = dw.Engine()
+        e.update_config({"schedule": [self.slot()]})
+        e.update_config({"schedule_skip": "a1b2c3d4"})
+        self.assertIn("a1b2c3d4", e.config["schedule_done"])
+        with self.assertRaises(dw.ApiError):
+            e.update_config({"schedule_skip": "ffffffff"})
+        with self.assertRaises(dw.ApiError):
+            e.update_config({"schedule": [self.slot(), self.slot()]})
+        with self.assertRaises(dw.ApiError):
+            e.update_config({"schedule": [self.slot()] * (dw.MAX_SLOTS + 1)})
+        e.update_config({"schedule": []})
+        self.assertEqual(e.config["schedule_done"], {})
+        self.assertIn("next_slot", e.snapshot())
+
+    def test_corrupted_schedule_is_dropped(self):
+        dw.save_json(dw.CONFIG_FILE, {"schedule": [{"start": "nope"}, self.slot()], "schedule_done": []})
+        cfg = dw.load_config()
+        self.assertEqual([s["id"] for s in cfg["schedule"]], ["a1b2c3d4"])
+        self.assertEqual(cfg["schedule_done"], {})
+        self.assertEqual(dw.DEFAULT_CONFIG["schedule"], [])
+
+
 # --- Liste des applications ----------------------------------------------------------------
 class TestScan(Sandbox):
     def scan(self, raw):

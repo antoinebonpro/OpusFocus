@@ -92,6 +92,8 @@ DEFAULT_CONFIG = {
     "music_autoplay": False,
     "default_minutes": 90,
     "launch_at_startup": True,
+    "schedule": [],       # plages horaires : la session démarre seule à l'heure prévue
+    "schedule_done": {},  # id de plage -> date (ISO) où elle a déjà eu lieu ou a été passée
     "shutdown_checklist": [
         "J'ai vérifié mes e-mails et messages une dernière fois",
         "J'ai noté chaque tâche en suspens dans ma liste",
@@ -156,8 +158,18 @@ def log_error() -> None:
 
 
 def load_config() -> dict:
-    cfg = dict(DEFAULT_CONFIG)
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))  # copie profonde : les listes par défaut ne sont jamais partagées
     cfg.update(load_json(CONFIG_FILE, {}))
+    # Un fichier abîmé ne doit pas faire planter la surveillance : on ne garde que les plages valides.
+    schedule = []
+    for raw in cfg["schedule"] if isinstance(cfg["schedule"], list) else []:
+        try:
+            schedule.append(clean_slot(raw))
+        except ApiError:
+            pass
+    cfg["schedule"] = schedule
+    if not isinstance(cfg["schedule_done"], dict):
+        cfg["schedule_done"] = {}
     return cfg
 
 
@@ -277,6 +289,77 @@ def clean_domain(site: str) -> str:
 def clean_phrase(text: str) -> str:
     """Phrase d'abandon comparable : minuscules, espaces superflus retirés, apostrophe typographique unifiée."""
     return " ".join(text.replace("’", "'").lower().split())
+
+
+TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+MAX_SLOTS = 30
+
+
+def clean_slot(raw) -> dict:
+    """Plage horaire validée (jours 0 = lundi … 6 = dimanche, heure « HH:MM », durée en minutes)."""
+    if not isinstance(raw, dict):
+        raise ApiError("Plage horaire invalide.")
+    start = str(raw.get("start", ""))
+    if not TIME_RE.match(start):
+        raise ApiError("Heure de début invalide (format HH:MM).")
+    minutes = _int(raw.get("minutes"), "Choisis une durée entre 5 et 480 minutes.")
+    if not 5 <= minutes <= 480:
+        raise ApiError("Choisis une durée entre 5 et 480 minutes.")
+    days = raw.get("days")
+    if not isinstance(days, list) or not all(isinstance(d, int) and not isinstance(d, bool) for d in days):
+        raise ApiError("Jours invalides.")
+    days = sorted({d for d in days if 0 <= d <= 6})
+    if not days:
+        raise ApiError("Choisis au moins un jour.")
+    intention = raw.get("intention", "")
+    intention = intention.strip()[:200] if isinstance(intention, str) else ""
+    slot_id = raw.get("id")
+    if not (isinstance(slot_id, str) and re.fullmatch(r"[0-9a-f]{8,16}", slot_id)):
+        slot_id = secrets.token_hex(4)
+    return {
+        "id": slot_id, "days": days, "start": start, "minutes": minutes,
+        "intention": intention or "Bloc de deep work planifié", "enabled": bool(raw.get("enabled", True)),
+        "notif": bool(raw.get("notif", True)), "apps": bool(raw.get("apps", True)),
+        "sites": bool(raw.get("sites", True)), "lock": bool(raw.get("lock", False)),
+    }
+
+
+def slot_window(slot: dict, day: dt.date) -> tuple[dt.datetime, dt.datetime]:
+    h, m = map(int, slot["start"].split(":"))
+    begin = dt.datetime.combine(day, dt.time(h, m))
+    return begin, begin + dt.timedelta(minutes=slot["minutes"])
+
+
+def due_slot(schedule: list, done: dict, now: dt.datetime) -> tuple[dict, int] | None:
+    """Plage en cours qui n'a pas encore eu lieu aujourd'hui, avec les minutes qu'il lui reste (5 au moins)."""
+    for slot in schedule:
+        if not slot["enabled"] or now.weekday() not in slot["days"] or done.get(slot["id"]) == now.date().isoformat():
+            continue
+        begin, end = slot_window(slot, now.date())
+        left = int((end - now).total_seconds() // 60)
+        if begin <= now < end and left >= 5:
+            return slot, left
+    return None
+
+
+def next_slot(schedule: list, done: dict, now: dt.datetime) -> dict | None:
+    """Prochaine plage à venir sur les 7 jours (début en timestamp), pour l'afficher dans l'interface."""
+    for offset in range(8):
+        day = now.date() + dt.timedelta(days=offset)
+        upcoming = []
+        for slot in schedule:
+            if not slot["enabled"] or day.weekday() not in slot["days"]:
+                continue
+            if offset == 0 and done.get(slot["id"]) == day.isoformat():
+                continue
+            begin, end = slot_window(slot, day)
+            if end > now:
+                upcoming.append((begin, slot))
+        if upcoming:
+            begin, slot = min(upcoming, key=lambda x: x[0])
+            return {"id": slot["id"], "at": begin.timestamp(), "minutes": slot["minutes"],
+                    "intention": slot["intention"], "start": slot["start"]}
+    return None
 
 
 def clean_app(name: str) -> str:
@@ -986,8 +1069,16 @@ class Engine:
             if st and time.time() >= st["end"]:
                 self._finish(completed=True)
                 return False
+            started = self._run_schedule()
             # Avec l'icône près de l'horloge, le moteur reste actif : on ne surveille l'inactivité que sans elle.
             idle = bool(self.on_idle) and not st and not self.review_id and time.time() - self.last_seen > IDLE_EXIT_SECONDS
+        if started:
+            if started["apps"]:
+                threading.Thread(target=kill_blocked, args=(list(self.config["apps"]),), daemon=True).start()
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            if self.url:
+                self.show_window()
+            return False
         if idle and find_app_window():
             # Fenêtre réduite ou en arrière-plan : le navigateur ralentit ses appels, mais elle est toujours là.
             self.last_seen, idle = time.time(), False
@@ -1005,6 +1096,21 @@ class Engine:
                         self.session["blocked_count"] += len(killed)
                         self.session["last_killed"] = {"names": killed, "at": time.time()}
         return False
+
+    def _run_schedule(self) -> dict | None:
+        """Lance la plage horaire en cours. Une plage qui tombe pendant une autre session compte comme faite."""
+        now = dt.datetime.now()
+        found = due_slot(self.config["schedule"], self.config["schedule_done"], now)
+        if not found:
+            return None
+        slot, minutes = found
+        self.config["schedule_done"][slot["id"]] = now.date().isoformat()
+        save_json(CONFIG_FILE, self.config)
+        if self.session:
+            return None
+        errors = self._open_session(slot["intention"], minutes, slot, scheduled=True)
+        self.notice = " · ".join([f"Plage de {slot['start']} : ta session a démarré.", *errors])
+        return self.session
 
     def ensure_window(self):
         """Au démarrage : une fenêtre restée ouverte se reconnecte seule (même port, même jeton).
@@ -1123,13 +1229,14 @@ class Engine:
             if self.session:
                 session = {k: self.session.get(k) for k in
                            ("intention", "start", "end", "planned_min", "lock", "notif", "apps", "sites",
-                            "blocked_count", "last_killed")}
+                            "blocked_count", "last_killed", "scheduled")}
             review = next((s for s in self.sessions if s["id"] == self.review_id), None) if self.review_id else None
             return {
                 "now": time.time(), "admin": self.can_block_sites(), "sites_helper": helper_alive(),
                 "config": self.config, "session": session,
                 "review": review, "sessions": self.sessions, "notice": notice,
                 "today": dt.date.today().isoformat(), "abandon_phrase": self.abandon_phrase(),
+                "next_slot": next_slot(self.config["schedule"], self.config["schedule_done"], dt.datetime.now()),
             }
 
     def abandon_phrase(self) -> str:
@@ -1149,22 +1256,25 @@ class Engine:
                 raise ApiError("Écris ton intention avant de commencer.")
             if not 5 <= minutes <= 480:
                 raise ApiError("Choisis une durée entre 5 et 480 minutes.")
-            now = time.time()
-            self.session = {
-                "id": secrets.token_hex(6), "active": True, "start": now, "end": now + minutes * 60,
-                "planned_min": minutes, "intention": intention[:200],
-                "notif": bool(data.get("notif")), "apps": bool(data.get("apps")),
-                "sites": bool(data.get("sites")) and self.can_block_sites(), "lock": bool(data.get("lock")),
-                "notif_prev": {}, "blocked_count": 0, "last_killed": None,
-                "phrase": self.abandon_phrase(),
-            }
-            self.review_id = None
             self.config["default_minutes"] = minutes
             save_json(CONFIG_FILE, self.config)
-            errors = self._apply_blocks()
+            errors = self._open_session(intention, minutes, data)
         if self.session.get("apps"):
             threading.Thread(target=kill_blocked, args=(list(self.config["apps"]),), daemon=True).start()
         return {"warnings": errors}
+
+    def _open_session(self, intention: str, minutes: int, options: dict, scheduled: bool = False) -> list[str]:
+        now = time.time()
+        self.session = {
+            "id": secrets.token_hex(6), "active": True, "start": now, "end": now + minutes * 60,
+            "planned_min": minutes, "intention": intention[:200],
+            "notif": bool(options.get("notif")), "apps": bool(options.get("apps")),
+            "sites": bool(options.get("sites")) and self.can_block_sites(), "lock": bool(options.get("lock")),
+            "notif_prev": {}, "blocked_count": 0, "last_killed": None,
+            "phrase": self.abandon_phrase(), "scheduled": scheduled,
+        }
+        self.review_id = None
+        return self._apply_blocks()
 
     def stop(self, data: dict):
         with self.lock:
@@ -1220,6 +1330,20 @@ class Engine:
             if "shutdown_checklist" in data:
                 cfg["shutdown_checklist"] = [x.strip()[:160] for x in _list_of_str(data, "shutdown_checklist")
                                              if x.strip()]
+            if "schedule" in data:
+                if not isinstance(data["schedule"], list) or len(data["schedule"]) > MAX_SLOTS:
+                    raise ApiError(f"{MAX_SLOTS} plages au maximum.")
+                schedule = [clean_slot(x) for x in data["schedule"]]
+                ids = {x["id"] for x in schedule}
+                if len(ids) != len(schedule):
+                    raise ApiError("Plages en double.")
+                cfg["schedule"] = schedule
+                cfg["schedule_done"] = {k: v for k, v in cfg["schedule_done"].items() if k in ids}
+            if "schedule_skip" in data:
+                slot_id = data["schedule_skip"]
+                if not any(x["id"] == slot_id for x in cfg["schedule"]):
+                    raise ApiError("Plage introuvable.")
+                cfg["schedule_done"][slot_id] = dt.date.today().isoformat()
             if data.get("shutdown_done"):
                 cfg["last_shutdown"] = dt.date.today().isoformat()
             save_json(CONFIG_FILE, cfg)

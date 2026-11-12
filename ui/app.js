@@ -38,12 +38,14 @@ const ICONS = {
   folder: '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
   gear: '<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
   power: '<path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.77.04"/>',
+  calendar: '<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/>',
 };
 const icon = (name, cls = "i") => `<svg class="${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
 
 // --- Données statiques --------------------------------------------------------------
 const PAGES = [
   { id: "session", label: "Session", icon: "timer" },
+  { id: "planning", label: "Planning", icon: "calendar" },
   { id: "apps", label: "Applications", icon: "grid" },
   { id: "sites", label: "Sites web", icon: "globe" },
   { id: "progress", label: "Progrès", icon: "chart" },
@@ -87,6 +89,7 @@ const draft = { intention: "", minutes: null, custom: false, notif: true, apps: 
 const appFilter = { q: "", cat: "all" };
 const siteFilter = { q: "" };
 const ritual = { checked: new Set(), editing: false };
+const plan = { editing: null, error: "" }; // editing : copie de la plage en cours de modification
 
 const now = () => Date.now() + clockOffset;
 const fmtClock = (ts) => new Date(ts).toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" });
@@ -155,7 +158,7 @@ async function poll() {
 
 // --- Navigation ------------------------------------------------------------------------
 function renderNav() {
-  const counts = { apps: S.config.apps.length, sites: S.config.sites.length };
+  const counts = { apps: S.config.apps.length, sites: S.config.sites.length, planning: S.config.schedule.filter((x) => x.enabled).length };
   $("#nav").innerHTML = PAGES.map((p) => `
     <a href="#${p.id}" title="${p.label}" ${p.id === page ? 'aria-current="page"' : ""}>
       ${icon(p.icon)}<span class="lbl">${p.label}</span>
@@ -191,9 +194,9 @@ window.addEventListener("hashchange", () => {
 
 function render() {
   if (!S) return;
-  const views = { session: viewSession, apps: viewApps, sites: viewSites, progress: viewProgress, ritual: viewRitual, rules: viewRules, settings: viewSettings };
+  const views = { session: viewSession, planning: viewPlanning, apps: viewApps, sites: viewSites, progress: viewProgress, ritual: viewRitual, rules: viewRules, settings: viewSettings };
   $("#main").innerHTML = `<div class="page">${views[page]()}</div>`;
-  const binders = { session: bindSession, apps: bindApps, sites: bindSites, progress: bindProgress, ritual: bindRitual, settings: bindSettings };
+  const binders = { session: bindSession, planning: bindPlanning, apps: bindApps, sites: bindSites, progress: bindProgress, ritual: bindRitual, settings: bindSettings };
   binders[page]?.();
 }
 
@@ -225,6 +228,7 @@ function viewSession() {
       <h1>Sur quoi vas-tu te concentrer ?</h1>
       <p class="quote">« ${QUOTE} »</p>
     </header>
+    ${nextSlotBanner()}
     <div class="stack">
       <section class="card">
         <label class="field-label" for="intention">Ton intention</label>
@@ -879,6 +883,199 @@ function bindRitual() {
   });
   $("#shutdown")?.addEventListener("click", async () => {
     try { S.config = (await api("/api/config", { shutdown_done: true })).config; ritual.checked.clear(); render(); } catch (e) { toast(e.message, "error"); }
+  });
+}
+
+// --- Planning (plages horaires) -----------------------------------------------------------
+const DAYS = ["Lundi", "Mardi", "Mercredi", "Jeudi", "Vendredi", "Samedi", "Dimanche"];
+const fmtDays = (days) => {
+  const key = days.join("");
+  if (key === "0123456") return "Tous les jours";
+  if (key === "01234") return "Du lundi au vendredi";
+  if (key === "56") return "Le week-end";
+  return days.map((d) => DAYS[d].slice(0, 3).toLowerCase() + ".").join(" ");
+};
+const endTime = (start, minutes) => {
+  const [h, m] = start.split(":").map(Number);
+  const t = (h * 60 + m + minutes) % 1440;
+  return `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
+};
+
+function fmtNextSlot(n) {
+  const d = new Date(n.at * 1000), today = new Date(now());
+  const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
+  const day = dayKey(d) === dayKey(today) ? "Aujourd'hui" : dayKey(d) === dayKey(tomorrow) ? "Demain"
+    : d.toLocaleDateString("fr-FR", { weekday: "long" }).replace(/^./, (c) => c.toUpperCase());
+  return `${day} à ${n.start.replace(":", " h ")}`;
+}
+
+function nextSlotBanner() {
+  const n = S.next_slot;
+  if (!n) return "";
+  const live = n.at * 1000 <= now();
+  return `<a class="card next-slot" href="#planning">
+    <div class="ico">${icon("calendar")}</div>
+    <div class="txt"><div class="eyebrow">${live ? "Plage en cours" : "Prochaine plage"}</div>
+      <div class="title">${esc(fmtNextSlot(n))} · ${fmtDuration(n.minutes)}</div>
+      <div class="desc">${esc(n.intention)}</div></div></a>`;
+}
+
+function blankSlot() {
+  return { id: null, days: [0, 1, 2, 3, 4], start: "09:00", minutes: 90, intention: "", enabled: true,
+           notif: true, apps: true, sites: S.admin, lock: false };
+}
+
+function viewPlanning() {
+  const slots = [...S.config.schedule].sort((a, b) => a.start.localeCompare(b.start));
+  const head = `<header class="page-head"><h1>Plages horaires</h1>
+    <p>La règle la plus simple à tenir : un bloc de deep work chaque jour à la même heure. À l'heure dite,
+      OpusFocus lance la session tout seul, avec les protections choisies. Il suffit qu'il tourne près de l'horloge.</p></header>`;
+  if (plan.editing) return head + viewSlotForm();
+  const n = S.next_slot;
+  const next = n ? `<section class="card next-slot static">
+      <div class="ico">${icon("calendar")}</div>
+      <div class="txt"><div class="eyebrow">Prochaine plage</div>
+        <div class="title">${esc(fmtNextSlot(n))} · ${fmtDuration(n.minutes)}</div>
+        <div class="desc">${esc(n.intention)}</div></div>
+      ${dayKey(new Date(n.at * 1000)) === S.today && !S.session ? `<button class="btn small ghost" data-skip="${esc(n.id)}">Passer aujourd'hui</button>` : ""}
+    </section>` : "";
+  const list = slots.length ? slots.map((x) => `
+    <div class="slot-row ${x.enabled ? "" : "off"}">
+      <div class="slot-time"><strong>${esc(x.start)}</strong><span>${esc(endTime(x.start, x.minutes))}</span></div>
+      <div class="txt"><div class="title">${esc(x.intention)}</div>
+        <div class="desc">${esc(fmtDays(x.days))} · ${fmtDuration(x.minutes)}${x.lock ? " · engagement" : ""}</div></div>
+      <button class="switch" role="switch" data-slot-toggle="${esc(x.id)}" aria-checked="${x.enabled}" aria-label="Activer la plage de ${esc(x.start)}"></button>
+      <button class="icon-btn" data-slot-edit="${esc(x.id)}" aria-label="Modifier la plage de ${esc(x.start)}">${icon("pencil")}</button>
+      <button class="icon-btn" data-slot-del="${esc(x.id)}" aria-label="Supprimer la plage de ${esc(x.start)}">${icon("trash")}</button>
+    </div>`).join("")
+    : `<p class="helper" style="margin:0">Aucune plage pour l'instant. Commence par une seule, le matin, quand ton esprit est frais.</p>`;
+  return head + `<div class="stack">${next}
+    <section class="card"><span class="field-label">Tes plages</span>${list}</section></div>
+    <div class="cta-row"><button class="btn primary" id="slot-add">${icon("plus")}Ajouter une plage</button></div>`;
+}
+
+function viewSlotForm() {
+  const x = plan.editing;
+  const custom = !DURATIONS.includes(x.minutes);
+  const row = (key, ico, title, desc, disabled = false) => `
+    <div class="toggle-row ${x[key] && !disabled ? "on" : ""} ${disabled ? "disabled" : ""}">
+      <div class="ico">${icon(ico)}</div>
+      <div class="txt"><div class="title" id="ts-${key}">${title}</div><div class="desc">${desc}</div></div>
+      <button class="switch" role="switch" data-slot-opt="${key}" aria-labelledby="ts-${key}"
+        aria-checked="${x[key] && !disabled}" ${disabled ? "disabled" : ""}></button>
+    </div>`;
+  return `<form class="stack" id="slot-form" novalidate>
+    <section class="card">
+      <label class="field-label" for="slot-intention">Intention</label>
+      <input id="slot-intention" class="input" maxlength="200" autocomplete="off" value="${esc(x.intention)}"
+        placeholder="Ex. : écrire 1 000 mots du mémoire">
+      <div class="helper">Laisse vide pour « Bloc de deep work planifié ».</div>
+    </section>
+    <section class="card">
+      <span class="field-label" id="days-label">Jours</span>
+      <div class="segmented days" role="group" aria-labelledby="days-label">
+        ${DAYS.map((d, i) => `<button type="button" data-day="${i}" aria-pressed="${x.days.includes(i)}" aria-label="${d}">${d.slice(0, 3)}</button>`).join("")}
+      </div>
+      <div class="slot-when">
+        <div><label class="field-label" for="slot-start">Début</label>
+          <input id="slot-start" class="input" type="time" value="${esc(x.start)}" required></div>
+        <div><span class="field-label" id="slot-dur-label">Durée</span>
+          <div class="segmented" role="group" aria-labelledby="slot-dur-label">
+            ${DURATIONS.map((m) => `<button type="button" data-slot-min="${m}" aria-pressed="${!custom && m === x.minutes}" aria-label="${fmtDuration(m)}">${durationChip(m)}</button>`).join("")}
+            <span class="custom-min"><input id="slot-min" class="input" type="number" min="5" max="480" step="5" value="${x.minutes}" aria-label="Durée en minutes"> min</span>
+          </div></div>
+      </div>
+      <div class="helper" id="slot-hint"></div>
+    </section>
+    <section class="card">
+      <span class="field-label">Protection</span>
+      ${row("notif", "bellOff", "Couper les notifications", "Windows reste silencieux pendant la plage.")}
+      ${row("apps", "grid", "Fermer les applications", `${plural(S.config.apps.length, "application sélectionnée", "applications sélectionnées")}`)}
+      ${row("sites", "globe", "Bloquer les sites web", S.admin ? `${plural(S.config.sites.length, "site sélectionné", "sites sélectionnés")}` : "Nécessite les droits administrateur au moment de la plage.", !S.admin)}
+      ${row("lock", "lock", "Mode engagement", "Pour arrêter avant la fin, il faudra taper ta phrase d'abandon.")}
+    </section>
+    ${plan.error ? `<div class="error-text">${icon("alert")}${esc(plan.error)}</div>` : ""}
+    <div class="cta-row"><button class="btn primary" type="submit">${icon("check")}Enregistrer la plage</button>
+      <button class="btn ghost" type="button" id="slot-cancel">Annuler</button></div>
+  </form>`;
+}
+
+async function saveSchedule(schedule, message) {
+  try {
+    S.config = (await api("/api/config", { schedule })).config;
+    plan.editing = null; plan.error = "";
+    await poll();
+    renderNav(); render();
+    if (message) toast(message);
+    return true;
+  } catch (e) {
+    plan.error = e.message;
+    render();
+    return false;
+  }
+}
+
+function bindPlanning() {
+  if (plan.editing) return bindSlotForm();
+  $("#slot-add").addEventListener("click", () => { plan.editing = blankSlot(); plan.error = ""; render(); $("#slot-intention")?.focus(); });
+  $$("[data-slot-edit]").forEach((b) => b.addEventListener("click", () => {
+    plan.editing = { ...S.config.schedule.find((x) => x.id === b.dataset.slotEdit) };
+    plan.error = ""; render();
+  }));
+  $$("[data-slot-del]").forEach((b) => b.addEventListener("click", () => {
+    saveSchedule(S.config.schedule.filter((x) => x.id !== b.dataset.slotDel), "Plage supprimée");
+  }));
+  $$("[data-slot-toggle]").forEach((b) => b.addEventListener("click", () => {
+    const id = b.dataset.slotToggle;
+    saveSchedule(S.config.schedule.map((x) => (x.id === id ? { ...x, enabled: !x.enabled } : x)), "Enregistré");
+  }));
+  $("[data-skip]")?.addEventListener("click", async (e) => {
+    try {
+      S.config = (await api("/api/config", { schedule_skip: e.currentTarget.dataset.skip })).config;
+      await poll(); render(); toast("Plage passée pour aujourd'hui");
+    } catch (err) { toast(err.message, "error"); }
+  });
+}
+
+function bindSlotForm() {
+  const x = plan.editing;
+  const hint = () => {
+    const ok = x.minutes >= 5 && x.minutes <= 480 && /^\d\d:\d\d$/.test(x.start);
+    $("#slot-hint").textContent = ok ? `De ${x.start} à ${endTime(x.start, x.minutes)} · ${fmtDuration(x.minutes)}` : "Durée entre 5 minutes et 8 heures.";
+  };
+  hint();
+  $("#slot-intention").addEventListener("input", (e) => { x.intention = e.target.value; });
+  $("#slot-start").addEventListener("input", (e) => { x.start = e.target.value; hint(); });
+  $("#slot-min").addEventListener("input", (e) => {
+    x.minutes = parseInt(e.target.value, 10) || 0;
+    $$("[data-slot-min]").forEach((b) => b.setAttribute("aria-pressed", +b.dataset.slotMin === x.minutes));
+    hint();
+  });
+  $$("[data-slot-min]").forEach((b) => b.addEventListener("click", () => {
+    x.minutes = +b.dataset.slotMin;
+    $("#slot-min").value = x.minutes;
+    $$("[data-slot-min]").forEach((o) => o.setAttribute("aria-pressed", o === b));
+    hint();
+  }));
+  $$("[data-day]").forEach((b) => b.addEventListener("click", () => {
+    const d = +b.dataset.day;
+    x.days = x.days.includes(d) ? x.days.filter((i) => i !== d) : [...x.days, d].sort();
+    b.setAttribute("aria-pressed", x.days.includes(d));
+  }));
+  $$("[data-slot-opt]").forEach((b) => b.addEventListener("click", () => {
+    const k = b.dataset.slotOpt;
+    x[k] = !x[k];
+    b.setAttribute("aria-checked", x[k]);
+    b.closest(".toggle-row").classList.toggle("on", x[k]);
+  }));
+  $("#slot-cancel").addEventListener("click", () => { plan.editing = null; plan.error = ""; render(); });
+  $("#slot-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    if (!x.days.length) { plan.error = "Choisis au moins un jour."; render(); return; }
+    const others = S.config.schedule.filter((o) => o.id !== x.id);
+    const { id, ...rest } = x;
+    saveSchedule(id ? S.config.schedule.map((o) => (o.id === id ? x : o)) : [...others, rest],
+      id ? "Plage modifiée" : "Plage ajoutée");
   });
 }
 

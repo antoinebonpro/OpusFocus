@@ -98,13 +98,14 @@ Si l'ordinateur ou le téléphone redémarre pendant une session, elle reprend l
 ## Les pages
 
 1. **Session** : intention, durée, protections, puis *Commencer*. Pendant la session, un minuteur et le nombre de distractions bloquées.
-2. **Applications** : les applications installées, avec leur icône et leur catégorie (réseaux, jeux, vidéo, navigateurs). Les distractions détectées sont proposées en premier. Sur Android, le mode « Seulement mes apps » bloque tout sauf les applications cochées (téléphone, clavier et réglages restent accessibles).
-3. **Sites web** : un catalogue à cocher, plus tes propres sites. Bloquer `youtube.com` bloque aussi `www.youtube.com` et `m.youtube.com`.
-4. **Progrès** : heures de la semaine et objectif, série de jours, profondeur moyenne, taux de sessions menées à terme, graphique par jour et historique.
-5. **Fin de journée** : la checklist du rituel de fin de journée, jusqu'au « Shutdown complete ».
-6. **Principes** : les quatre règles du livre.
-7. **Musique focus** : tes pistes audio. Elles reprennent là où tu t'étais arrêté et peuvent démarrer et s'arrêter avec la session. Sur PC, dépose tes fichiers (`mp3`, `m4a`, `aac`…) dans `Musique\OpusFocus` ; sur Android, ajoute-les depuis l'application.
-8. **Réglages** : démarrage, musique, phrase d'abandon, objectif de la semaine, état du blocage des sites.
+2. **Planning** (Windows) : tes plages horaires de deep work, par exemple « du lundi au vendredi, 9 h, 2 h ». À l'heure dite, la session démarre toute seule avec les protections choisies pour cette plage (mode engagement compris) et la fenêtre s'ouvre. Il suffit qu'OpusFocus tourne près de l'horloge, ce qui est le cas par défaut depuis le démarrage de Windows. Si le PC s'allume en cours de plage, la session démarre pour le temps restant (5 minutes au moins). Une plage qui tombe pendant une autre session, ou que tu passes avec *Passer aujourd'hui*, ne revient que le jour suivant prévu.
+3. **Applications** : les applications installées, avec leur icône et leur catégorie (réseaux, jeux, vidéo, navigateurs). Les distractions détectées sont proposées en premier. Sur Android, le mode « Seulement mes apps » bloque tout sauf les applications cochées (téléphone, clavier et réglages restent accessibles).
+4. **Sites web** : un catalogue à cocher, plus tes propres sites. Bloquer `youtube.com` bloque aussi `www.youtube.com` et `m.youtube.com`.
+5. **Progrès** : heures de la semaine et objectif, série de jours, profondeur moyenne, taux de sessions menées à terme, graphique par jour et historique.
+6. **Fin de journée** : la checklist du rituel de fin de journée, jusqu'au « Shutdown complete ».
+7. **Principes** : les quatre règles du livre.
+8. **Musique focus** : tes pistes audio. Elles reprennent là où tu t'étais arrêté et peuvent démarrer et s'arrêter avec la session. Sur PC, dépose tes fichiers (`mp3`, `m4a`, `aac`…) dans `Musique\OpusFocus` ; sur Android, ajoute-les depuis l'application.
+9. **Réglages** : démarrage, musique, phrase d'abandon, objectif de la semaine, état du blocage des sites.
 
 <div align="center">
 <img src="docs/img/pc-progres.webp" width="49%" alt="Page Progrès sur Windows">
